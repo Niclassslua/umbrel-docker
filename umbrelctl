@@ -293,6 +293,47 @@ require_jq() {
   fi
 }
 
+required_tools() {
+  printf '%s\n' docker git jq rsync
+}
+
+tool_install_hint() {
+  case "$1" in
+    docker) printf "Docker Engine or Docker Desktop" ;;
+    git)    printf "git" ;;
+    jq)     printf "jq" ;;
+    rsync)  printf "rsync" ;;
+    *)      printf "%s" "$1" ;;
+  esac
+}
+
+first_line() {
+  local value="$1"
+  printf "%s" "${value%%$'\n'*}"
+}
+
+missing_required_tools() {
+  local tool
+  while IFS= read -r tool; do
+    [[ -z "${tool}" ]] && continue
+    command -v "${tool}" >/dev/null 2>&1 || printf '%s\n' "${tool}"
+  done < <(required_tools)
+}
+
+print_missing_required_tools() {
+  local missing
+  missing="$(missing_required_tools)"
+  [[ -z "${missing}" ]] && return 0
+
+  err "Missing required tool(s):"
+  local tool
+  while IFS= read -r tool; do
+    [[ -z "${tool}" ]] && continue
+    printf "  - %s (%s)\n" "${tool}" "$(tool_install_hint "${tool}")" >&2
+  done <<< "${missing}"
+  return 1
+}
+
 validate_runtime_profile() {
   if [[ "$RUNTIME_PROFILE" != "minimal" && "$RUNTIME_PROFILE" != "compat" ]]; then
     err "--runtime-profile must be one of: minimal, compat"
@@ -506,12 +547,36 @@ check_env() {
   _chk_ok()   { ok   "$*"; (( pass++ )) || true; }
   _chk_warn() { warn "$*"; (( fail++ )) || true; }
 
-  # docker binary
-  if command -v docker >/dev/null 2>&1; then
-    _chk_ok "docker: $(docker --version 2>/dev/null | head -n1)"
-  else
-    _chk_warn "docker: not found in PATH"
-  fi
+  local missing_tools
+  missing_tools="$(missing_required_tools)"
+
+  # required command-line tools
+  local tool tool_detail version_output
+  while IFS= read -r tool; do
+    case "${tool}" in
+      docker)
+        version_output="$(docker --version 2>/dev/null || true)"
+        tool_detail="$(first_line "${version_output}")"
+        ;;
+      git)
+        version_output="$(git --version 2>/dev/null || true)"
+        tool_detail="$(first_line "${version_output}")"
+        ;;
+      jq)     tool_detail="$(jq --version 2>/dev/null)" ;;
+      rsync)
+        version_output="$(rsync --version 2>/dev/null || true)"
+        tool_detail="$(first_line "${version_output}")"
+        tool_detail="${tool_detail:0:40}"
+        ;;
+      *)      tool_detail="" ;;
+    esac
+
+    if [[ -n "${tool_detail}" ]]; then
+      _chk_ok "${tool}: ${tool_detail}"
+    else
+      _chk_warn "${tool}: not found (install ${tool_install_hint "${tool}")})"
+    fi
+  done < <(required_tools)
 
   # docker daemon
   if [[ -S "${DOCKER_SOCKET}" ]]; then
@@ -524,28 +589,16 @@ check_env() {
     _chk_warn "docker daemon: socket not found at ${DOCKER_SOCKET}"
   fi
 
-  # git
-  if command -v git >/dev/null 2>&1; then
-    _chk_ok "git: $(git --version 2>/dev/null | head -n1)"
-  else
-    _chk_warn "git: not found (needed for 'versions' command)"
-  fi
-
-  # jq
-  if command -v jq >/dev/null 2>&1; then
-    _chk_ok "jq: $(jq --version 2>/dev/null)"
-  else
-    _chk_warn "jq: not found (needed for 'update' and 'agent')"
-  fi
-
-  # rsync
-  if command -v rsync >/dev/null 2>&1; then
-    _chk_ok "rsync: $(rsync --version 2>/dev/null | head -n1 | cut -c1-40)"
-  else
-    _chk_warn "rsync: not found (needed for update backups)"
-  fi
-
   printf "\n"
+
+  if [[ -n "${missing_tools}" ]]; then
+    err "Install the missing required tool(s):"
+    while IFS= read -r tool; do
+      [[ -z "${tool}" ]] && continue
+      printf "  - %s (%s)\n" "${tool}" "$(tool_install_hint "${tool}")" >&2
+    done <<< "${missing_tools}"
+    printf "\n" >&2
+  fi
 
   # data directory
   if [[ -d "${DATA_DIR}" ]]; then
