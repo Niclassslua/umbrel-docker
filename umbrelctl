@@ -1,0 +1,1400 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+DOCKERFILE="${SCRIPT_DIR}/Dockerfile"
+DOCKER_SOCKET="/var/run/docker.sock"
+DOCKER_FALLBACK_DIR="/Volume1/@apps/DockerEngine/dockerd/bin"
+CONFIG_FILE="${SCRIPT_DIR}/.umbrelctl.conf"
+
+# NAS fallback: some systems ship Docker outside the default PATH.
+if ! command -v docker >/dev/null 2>&1 && [[ -x "${DOCKER_FALLBACK_DIR}/docker" ]]; then
+  export PATH="${DOCKER_FALLBACK_DIR}:${PATH}"
+fi
+
+# ── defaults (overridden by .umbrelctl.conf, then by CLI flags) ───────────────
+REF="1.5.0"
+IMAGE=""
+IMAGE_SET="false"
+CONTAINER_NAME="umbrel"
+DATA_DIR="${SCRIPT_DIR}/umbrel-data"
+DATA_DIR_SET="false"
+HOST_PORT="80"
+STOP_TIMEOUT="60"
+NO_CACHE="false"
+PULL="false"
+FOLLOW_LOGS="false"
+RUNTIME_PROFILE="minimal"
+RUNTIME_PROFILE_SET="false"
+SKIP_BUILD="false"
+FORCE_UPDATE="false"
+RELEASE_CHANNEL="stable"
+RELEASE_CHANNEL_SET="false"
+AGENT_POLL_INTERVAL="3"
+AGENT_ONCE="false"
+AGENT_DAEMON="false"
+AGENT_LOG_FILE=""
+BACKUP_ENABLED="true"
+BACKUP_DIR=""
+HEALTH_TIMEOUT="180"
+LIST_ALL_REFS="false"
+LIST_LIMIT="0"
+BACKUPS_KEEP="5"
+LOGS_TAIL="200"
+SUBCOMMAND=""
+declare -a BUILD_LABELS=()
+
+# ── colour codes (only when stdout is a tty) ──────────────────────────────────
+C_RED=''; C_GREEN=''; C_YELLOW=''; C_CYAN=''; C_BOLD=''; C_DIM=''; C_RESET=''
+if [[ -t 1 ]] && command -v tput >/dev/null 2>&1; then
+  C_RED="$(tput setaf 1 2>/dev/null || true)"
+  C_GREEN="$(tput setaf 2 2>/dev/null || true)"
+  C_YELLOW="$(tput setaf 3 2>/dev/null || true)"
+  C_CYAN="$(tput setaf 6 2>/dev/null || true)"
+  C_BOLD="$(tput bold 2>/dev/null || true)"
+  C_DIM="$(tput dim 2>/dev/null || true)"
+  C_RESET="$(tput sgr0 2>/dev/null || true)"
+fi
+
+# ── logging helpers ───────────────────────────────────────────────────────────
+info() { printf "%s==>%s %s\n"    "${C_CYAN}"   "${C_RESET}" "$*"; }
+ok()   { printf "%s ✓%s  %s\n"   "${C_GREEN}"  "${C_RESET}" "$*"; }
+warn() { printf "%sWARN:%s %s\n"  "${C_YELLOW}" "${C_RESET}" "$*" >&2; }
+err()  { printf "%sERROR:%s %s\n" "${C_RED}"    "${C_RESET}" "$*" >&2; }
+
+# ── config file ───────────────────────────────────────────────────────────────
+load_config() {
+  [[ ! -f "${CONFIG_FILE}" ]] && return
+  local line key value
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    [[ "${line}" =~ ^[[:space:]]*# ]] && continue
+    [[ "${line}" =~ ^[[:space:]]*$ ]] && continue
+    key="${line%%=*}"
+    value="${line#*=}"
+    value="${value%%#*}"                           # strip inline comments
+    value="${value#"${value%%[! ]*}"}"             # ltrim
+    value="${value%"${value##*[! ]}"}"             # rtrim
+    key="${key// /}"
+    case "${key}" in
+      REF)             REF="${value}" ;;
+      CONTAINER_NAME)  CONTAINER_NAME="${value}" ;;
+      DATA_DIR)        DATA_DIR="${value}" ;;
+      HOST_PORT)       HOST_PORT="${value}" ;;
+      STOP_TIMEOUT)    STOP_TIMEOUT="${value}" ;;
+      RUNTIME_PROFILE) RUNTIME_PROFILE="${value}" ;;
+      RELEASE_CHANNEL) RELEASE_CHANNEL="${value}" ;;
+      HEALTH_TIMEOUT)  HEALTH_TIMEOUT="${value}" ;;
+      BACKUP_DIR)      BACKUP_DIR="${value}" ;;
+      BACKUP_ENABLED)  BACKUP_ENABLED="${value}" ;;
+      BACKUPS_KEEP)    BACKUPS_KEEP="${value}" ;;
+    esac
+  done < "${CONFIG_FILE}"
+}
+
+save_config_key() {
+  local key="$1" value="$2"
+  if [[ -f "${CONFIG_FILE}" ]] && grep -q "^${key}=" "${CONFIG_FILE}" 2>/dev/null; then
+    local tmp
+    tmp="$(mktemp)"
+    sed "s|^${key}=.*|${key}=${value}|" "${CONFIG_FILE}" > "${tmp}"
+    mv "${tmp}" "${CONFIG_FILE}"
+  else
+    printf "%s=%s\n" "${key}" "${value}" >> "${CONFIG_FILE}"
+  fi
+}
+
+remove_config_key() {
+  local key="$1"
+  [[ ! -f "${CONFIG_FILE}" ]] && return
+  local tmp
+  tmp="$(mktemp)"
+  grep -v "^${key}=" "${CONFIG_FILE}" > "${tmp}" || true
+  mv "${tmp}" "${CONFIG_FILE}"
+}
+
+# Load config before CLI flags (so flags can override)
+load_config
+
+# ── usage ─────────────────────────────────────────────────────────────────────
+usage() {
+  cat <<'EOF'
+umbrelctl - local CLI for building, running and managing Umbrel OS containers
+
+Usage:
+  ./umbrelctl <command> [options]
+
+Commands:
+  build      Build image for a ref (tag/branch/commit)
+  up         Build (optional) and recreate/start container
+  down       Stop and remove container
+  update     Update existing container to a new version with backup + auto rollback
+  agent      Manage host-side update agent  (subcommands: start stop status logs)
+  versions   List installable Umbrel refs (tags from upstream)
+  status     Show running Umbrel container(s) at a glance
+  logs       Tail or stream container logs
+  shell      Open an interactive shell inside the container
+  open       Open the Umbrel web UI in your default browser
+  backups    Manage backups                 (subcommands: list prune restore)
+  config     Show or persist configuration  (subcommands: show set unset)
+  check      Validate prerequisites and environment
+  help       Show this help
+
+Common options:
+  --ref <value>                Umbrel git ref (e.g. 1.5.0, v1.5.0, master, <commit>)
+  --image <name:tag>           Docker image name/tag (default: umbrel:<sanitized-ref>)
+  --name <container>           Container name (default: umbrel)
+  --data-dir <path>            Host directory mounted to /data
+  --port <host-port>           Host port mapped to container 80 (default: 80)
+  --stop-timeout <sec>         Stop timeout in seconds (default: 60)
+  --runtime-profile <profile>  Runtime profile: minimal|compat (default: minimal)
+  --release-channel <channel>  Release channel: stable|beta (default: stable)
+  --no-cache                   Build with --no-cache
+  --pull                       Build with --pull
+  --label <key=value>          Additional Docker build label (repeatable; build only)
+  --follow                     Follow logs after up/update; stream for 'logs'
+  --force                      Force update even if target equals current; skip restore confirm
+  --all                        For 'versions': include pre-release/extra tags
+  --limit <n>                  For 'versions': max number of refs to show
+  --tail <n>                   For 'logs': lines to show (default: 200)
+  --keep <n>                   For 'backups prune': backups to keep (default: 5)
+
+up options:
+  --skip-build                 Do not build before start
+
+update options:
+  --no-backup                  Disable pre-update backup
+  --backup-dir <path>          Backup root dir (default: <data-dir>/../umbrel-backups)
+  --health-timeout <sec>       Health-check timeout (default: 180)
+
+agent subcommands:
+  ./umbrelctl agent [start]    Start the update agent
+  ./umbrelctl agent status     Show whether the agent daemon is running
+  ./umbrelctl agent stop       Stop a running agent daemon
+  ./umbrelctl agent logs       Print (or follow with --follow) the agent log
+
+  --poll-interval <sec>        For 'agent start': poll interval (default: 3)
+  --once                       For 'agent start': process one request and exit
+  --daemon                     For 'agent start': run in background
+  --log-file <path>            For 'agent': explicit log file path
+
+backups subcommands:
+  ./umbrelctl backups [list]            List backups with size and date
+  ./umbrelctl backups prune             Delete oldest backups (--keep N, default 5)
+  ./umbrelctl backups restore <path>    Restore data dir from a backup (name or full path)
+
+config subcommands:
+  ./umbrelctl config [show]             Show current effective configuration
+  ./umbrelctl config set KEY VALUE      Persist a setting in .umbrelctl.conf
+  ./umbrelctl config unset KEY          Remove a setting from .umbrelctl.conf
+
+Examples:
+  ./umbrelctl check
+  ./umbrelctl versions
+  ./umbrelctl build --ref 1.5.0
+  ./umbrelctl up --ref 1.5.0 --port 8080 --follow
+  ./umbrelctl status
+  ./umbrelctl logs --follow
+  ./umbrelctl shell
+  ./umbrelctl open
+  ./umbrelctl update --ref 1.6.1 --follow
+  ./umbrelctl backups list
+  ./umbrelctl backups prune --keep 3
+  ./umbrelctl backups restore 20250420-120000-umbrel-1.5.0
+  ./umbrelctl agent start --daemon
+  ./umbrelctl agent status
+  ./umbrelctl agent logs --follow
+  ./umbrelctl config set HOST_PORT 8080
+  ./umbrelctl down
+EOF
+}
+
+# ── utilities ─────────────────────────────────────────────────────────────────
+sanitize_ref_for_tag() {
+  local value="$1"
+  value="${value#refs/tags/}"
+  value="${value#refs/heads/}"
+  value="${value//\//-}"
+  value="${value//:/-}"
+  value="${value// /-}"
+  value="$(printf "%s" "$value" | tr -cd '[:alnum:]._-')"
+  [[ -z "$value" ]] && value="latest"
+  printf "%s" "$value"
+}
+
+ensure_image_default() {
+  if [[ -z "$IMAGE" ]]; then
+    IMAGE="umbrel:$(sanitize_ref_for_tag "$REF")"
+  fi
+}
+
+default_backup_dir() {
+  printf "%s/umbrel-backups" "$(cd "$(dirname "$DATA_DIR")" && pwd)"
+}
+
+reverse_lines() {
+  if command -v tac >/dev/null 2>&1; then
+    tac
+  elif command -v tail >/dev/null 2>&1 && tail -r /dev/null >/dev/null 2>&1; then
+    tail -r
+  else
+    awk '{a[NR]=$0} END{for (i=NR; i>=1; i--) print a[i]}'
+  fi
+}
+
+file_mtime() {
+  # Cross-platform: print modification date/time of a file
+  local file="$1"
+  if stat --version >/dev/null 2>&1; then
+    stat -c '%y' "${file}" 2>/dev/null | cut -c1-16 || echo '?'
+  else
+    stat -f '%Sm' -t '%Y-%m-%d %H:%M' "${file}" 2>/dev/null || echo '?'
+  fi
+}
+
+require_docker_socket() {
+  if [[ ! -S "${DOCKER_SOCKET}" ]]; then
+    err "Docker socket not found at ${DOCKER_SOCKET}"
+    exit 1
+  fi
+}
+
+host_sensor_binds() {
+  case "$(uname -s)" in
+    Linux)
+      [[ -d "/sys/class/thermal" ]] && printf '%s\n' "/sys/class/thermal:/sys/class/thermal:ro"
+      [[ -d "/sys/class/hwmon" ]] && printf '%s\n' "/sys/class/hwmon:/sys/class/hwmon:ro"
+      ;;
+  esac
+}
+
+append_host_sensor_binds() {
+  local array_name="$1"
+  local -n args_ref="${array_name}"
+  local bind existing index
+  local -a sensor_binds=()
+
+  mapfile -t sensor_binds < <(host_sensor_binds)
+  for bind in "${sensor_binds[@]}"; do
+    existing="false"
+    for ((index = 0; index < ${#args_ref[@]}; index++)); do
+      if [[ "${args_ref[$index]}" == "-v" && "${args_ref[$((index + 1))]:-}" == "${bind}" ]]; then
+        existing="true"
+        break
+      fi
+    done
+    [[ "${existing}" == "true" ]] || args_ref+=(-v "${bind}")
+  done
+}
+
+require_jq() {
+  if ! command -v jq >/dev/null 2>&1; then
+    err "jq is required for this operation."
+    exit 1
+  fi
+}
+
+validate_runtime_profile() {
+  if [[ "$RUNTIME_PROFILE" != "minimal" && "$RUNTIME_PROFILE" != "compat" ]]; then
+    err "--runtime-profile must be one of: minimal, compat"
+    exit 1
+  fi
+}
+
+validate_release_channel() {
+  if [[ "$RELEASE_CHANNEL" != "stable" && "$RELEASE_CHANNEL" != "beta" ]]; then
+    err "--release-channel must be one of: stable, beta"
+    exit 1
+  fi
+}
+
+# ── option parsing ─────────────────────────────────────────────────────────────
+parse_options() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --ref)            REF="${2:?missing value for --ref}"; shift 2 ;;
+      --image)          IMAGE="${2:?missing value for --image}"; IMAGE_SET="true"; shift 2 ;;
+      --name)           CONTAINER_NAME="${2:?missing value for --name}"; shift 2 ;;
+      --data-dir)       DATA_DIR="${2:?missing value for --data-dir}"; DATA_DIR_SET="true"; shift 2 ;;
+      --port)           HOST_PORT="${2:?missing value for --port}"; shift 2 ;;
+      --stop-timeout)   STOP_TIMEOUT="${2:?missing value for --stop-timeout}"; shift 2 ;;
+      --runtime-profile) RUNTIME_PROFILE="${2:?missing value for --runtime-profile}"; RUNTIME_PROFILE_SET="true"; shift 2 ;;
+      --release-channel) RELEASE_CHANNEL="${2:?missing value for --release-channel}"; RELEASE_CHANNEL_SET="true"; shift 2 ;;
+      --no-cache)       NO_CACHE="true"; shift 1 ;;
+      --pull)           PULL="true"; shift 1 ;;
+      --label)          BUILD_LABELS+=("${2:?missing value for --label}"); shift 2 ;;
+      --follow)         FOLLOW_LOGS="true"; shift 1 ;;
+      --force)          FORCE_UPDATE="true"; shift 1 ;;
+      --skip-build)     SKIP_BUILD="true"; shift 1 ;;
+      --no-backup)      BACKUP_ENABLED="false"; shift 1 ;;
+      --backup-dir)     BACKUP_DIR="${2:?missing value for --backup-dir}"; shift 2 ;;
+      --health-timeout) HEALTH_TIMEOUT="${2:?missing value for --health-timeout}"; shift 2 ;;
+      --all)            LIST_ALL_REFS="true"; shift 1 ;;
+      --limit)          LIST_LIMIT="${2:?missing value for --limit}"; shift 2 ;;
+      --poll-interval)  AGENT_POLL_INTERVAL="${2:?missing value for --poll-interval}"; shift 2 ;;
+      --once)           AGENT_ONCE="true"; shift 1 ;;
+      --daemon)         AGENT_DAEMON="true"; shift 1 ;;
+      --log-file)       AGENT_LOG_FILE="${2:?missing value for --log-file}"; shift 2 ;;
+      --tail)           LOGS_TAIL="${2:?missing value for --tail}"; shift 2 ;;
+      --keep)           BACKUPS_KEEP="${2:?missing value for --keep}"; shift 2 ;;
+      --help|-h)        usage; exit 0 ;;
+      *) err "Unknown option: $1"; usage; exit 1 ;;
+    esac
+  done
+}
+
+# ── build ─────────────────────────────────────────────────────────────────────
+build_image() {
+  ensure_image_default
+  validate_runtime_profile
+
+  local candidates=("${REF}")
+  if [[ "${REF}" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.]+)?$ ]]; then
+    candidates+=("v${REF}")
+  elif [[ "${REF}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.]+)?$ ]]; then
+    candidates+=("${REF#v}")
+  fi
+
+  local candidate args tried=()
+  for candidate in "${candidates[@]}"; do
+    [[ " ${tried[*]} " == *" ${candidate} "* ]] && continue
+    tried+=("${candidate}")
+
+    local ref_no_v major minor
+    ref_no_v="${candidate#v}"
+    major=""
+    minor=""
+    if [[ "${ref_no_v}" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+) ]]; then
+      major="${BASH_REMATCH[1]}"
+      minor="${BASH_REMATCH[2]}"
+    fi
+
+    local node_versions=()
+    if [[ -n "${major}" && -n "${minor}" ]]; then
+      if (( major == 0 )) || (( major == 1 && minor <= 2 )); then
+        node_versions=("18.20.4" "20.19.0" "22.13.0")
+      elif (( major == 1 && minor <= 4 )); then
+        node_versions=("20.19.0" "22.13.0" "18.20.4")
+      else
+        node_versions=("22.13.0" "20.19.0" "18.20.4")
+      fi
+    else
+      node_versions=("22.13.0" "20.19.0" "18.20.4")
+    fi
+
+    local node_version node_tried=()
+    for node_version in "${node_versions[@]}"; do
+      [[ " ${node_tried[*]} " == *" ${node_version} "* ]] && continue
+      node_tried+=("${node_version}")
+
+      local label
+      args=(build)
+      [[ "$NO_CACHE" == "true" ]] && args+=(--no-cache)
+      [[ "$PULL" == "true" ]] && args+=(--pull)
+      args+=(--build-arg "VERSION_ARG=${candidate}" --build-arg "NODE_VERSION=${node_version}")
+      for label in "${BUILD_LABELS[@]}"; do
+        args+=(--label "${label}")
+      done
+      args+=(-t "${IMAGE}" -f "${DOCKERFILE}" "${SCRIPT_DIR}")
+
+      info "Building image ${IMAGE} from ref ${candidate} (Node ${node_version})"
+      local build_log
+      build_log="$(mktemp)"
+      if docker "${args[@]}" 2>&1 | tee "${build_log}"; then
+        rm -f "${build_log}"
+        return 0
+      fi
+      if grep -Eiq 'context canceled|failed to solve: Canceled|failed to run Build function: Canceled' "${build_log}"; then
+        rm -f "${build_log}"
+        err "Build canceled by Docker/BuildKit. Aborting retries."
+        exit 1
+      fi
+      rm -f "${build_log}"
+      warn "Build failed for ref ${candidate} with Node ${node_version}"
+    done
+  done
+
+  err "Build failed for all ref candidates: ${candidates[*]}"
+  exit 1
+}
+
+resolve_target_image() {
+  if [[ "${IMAGE_SET}" == "true" ]]; then
+    if [[ "${PULL}" == "true" ]]; then
+      info "Pulling target image ${IMAGE}"
+      docker pull "${IMAGE}"
+    else
+      info "Using provided target image ${IMAGE}"
+    fi
+    return
+  fi
+
+  ensure_image_default
+  build_image
+}
+
+# ── container lifecycle ───────────────────────────────────────────────────────
+container_exists() {
+  docker ps -a --format '{{.Names}}' | grep -Fx "${CONTAINER_NAME}" >/dev/null 2>&1
+}
+
+remove_existing_container_if_any() {
+  if container_exists; then
+    info "Removing existing container ${CONTAINER_NAME}"
+    docker rm -f "${CONTAINER_NAME}" >/dev/null
+  fi
+}
+
+run_new_container() {
+  ensure_image_default
+  validate_runtime_profile
+  validate_release_channel
+  require_docker_socket
+  mkdir -p "${DATA_DIR}"
+  local -a run_args=(
+    --name "${CONTAINER_NAME}"
+    --pid=host
+    --cap-add SYS_ADMIN
+    -p "${HOST_PORT}:80"
+    -p "139:139"
+    -p "445:445"
+    -p "3702:3702/tcp"
+    -p "3702:3702/udp"
+    -p "5355:5355/tcp"
+    -p "5355:5355/udp"
+    -v "${DATA_DIR}:/data"
+    -v "${DOCKER_SOCKET}:${DOCKER_SOCKET}"
+    -e "UMBREL_RUNTIME_PROFILE=${RUNTIME_PROFILE}"
+    -e "UMBREL_RELEASE_CHANNEL=${RELEASE_CHANNEL}"
+    --stop-timeout "${STOP_TIMEOUT}"
+  )
+  append_host_sensor_binds run_args
+
+  info "Starting container ${CONTAINER_NAME} (${IMAGE})"
+  docker run -d "${run_args[@]}" "${IMAGE}" >/dev/null
+}
+
+up_container() {
+  if [[ "$SKIP_BUILD" != "true" ]]; then
+    build_image
+  else
+    ensure_image_default
+  fi
+  remove_existing_container_if_any
+  run_new_container
+
+  if [[ "$FOLLOW_LOGS" == "true" ]]; then
+    docker logs -f "${CONTAINER_NAME}"
+  else
+    info "Container started. Open: http://localhost:${HOST_PORT}"
+  fi
+}
+
+down_container() {
+  if container_exists; then
+    info "Stopping/removing ${CONTAINER_NAME}"
+    docker rm -f "${CONTAINER_NAME}" >/dev/null
+  else
+    warn "Container ${CONTAINER_NAME} does not exist."
+  fi
+}
+
+# ── check ─────────────────────────────────────────────────────────────────────
+check_env() {
+  local pass=0 fail=0
+  printf "\n%sEnvironment check%s\n\n" "${C_BOLD}" "${C_RESET}"
+
+  _chk_ok()   { ok   "$*"; (( pass++ )) || true; }
+  _chk_warn() { warn "$*"; (( fail++ )) || true; }
+
+  # docker binary
+  if command -v docker >/dev/null 2>&1; then
+    _chk_ok "docker: $(docker --version 2>/dev/null | head -n1)"
+  else
+    _chk_warn "docker: not found in PATH"
+  fi
+
+  # docker daemon
+  if [[ -S "${DOCKER_SOCKET}" ]]; then
+    if docker info >/dev/null 2>&1; then
+      _chk_ok "docker daemon: reachable via ${DOCKER_SOCKET}"
+    else
+      _chk_warn "docker daemon: socket exists but daemon not responding"
+    fi
+  else
+    _chk_warn "docker daemon: socket not found at ${DOCKER_SOCKET}"
+  fi
+
+  # git
+  if command -v git >/dev/null 2>&1; then
+    _chk_ok "git: $(git --version 2>/dev/null | head -n1)"
+  else
+    _chk_warn "git: not found (needed for 'versions' command)"
+  fi
+
+  # jq
+  if command -v jq >/dev/null 2>&1; then
+    _chk_ok "jq: $(jq --version 2>/dev/null)"
+  else
+    _chk_warn "jq: not found (needed for 'update' and 'agent')"
+  fi
+
+  # rsync
+  if command -v rsync >/dev/null 2>&1; then
+    _chk_ok "rsync: $(rsync --version 2>/dev/null | head -n1 | cut -c1-40)"
+  else
+    _chk_warn "rsync: not found (needed for update backups)"
+  fi
+
+  printf "\n"
+
+  # data directory
+  if [[ -d "${DATA_DIR}" ]]; then
+    if [[ -w "${DATA_DIR}" ]]; then
+      _chk_ok "data-dir: ${DATA_DIR} (exists, writable)"
+    else
+      _chk_warn "data-dir: ${DATA_DIR} (NOT writable)"
+    fi
+  else
+    _chk_ok "data-dir: ${DATA_DIR} (does not exist yet — will be created on 'up')"
+  fi
+
+  # port availability
+  local port_in_use="false"
+  if command -v lsof >/dev/null 2>&1; then
+    lsof -iTCP:"${HOST_PORT}" -sTCP:LISTEN >/dev/null 2>&1 && port_in_use="true" || true
+  elif command -v ss >/dev/null 2>&1; then
+    ss -tlnp 2>/dev/null | grep -q ":${HOST_PORT} " && port_in_use="true" || true
+  fi
+  if [[ "${port_in_use}" == "true" ]]; then
+    _chk_warn "port ${HOST_PORT}: already in use (set HOST_PORT in .umbrelctl.conf or use --port)"
+  else
+    _chk_ok "port ${HOST_PORT}: available"
+  fi
+
+  # config file
+  if [[ -f "${CONFIG_FILE}" ]]; then
+    _chk_ok "config: ${CONFIG_FILE}"
+  else
+    ok "config: no .umbrelctl.conf (using built-in defaults)"
+  fi
+
+  printf "\n%s%d passed, %d warning/failed%s\n\n" \
+    "${C_BOLD}" "${pass}" "${fail}" "${C_RESET}"
+  unset -f _chk_ok _chk_warn
+  [[ "${fail}" -eq 0 ]]
+}
+
+# ── status ─────────────────────────────────────────────────────────────────────
+_umbrel_containers() {
+  # Print name|image|status|ports for every container that looks like Umbrel
+  docker ps -a --format '{{.Names}}|{{.Image}}|{{.Status}}|{{.Ports}}' 2>/dev/null \
+    | awk -F'|' '($1 ~ /umbrel/ || $2 ~ /^umbrel:/)' \
+    || true
+}
+
+_container_version() {
+  local name="$1"
+  local ver
+  # Prefer /run/version inside a running container (accurate for branch builds)
+  ver="$(docker exec "${name}" cat /run/version 2>/dev/null | tr -d '[:space:]' || true)"
+  if [[ -z "${ver}" ]]; then
+    ver="$(docker inspect --format '{{.Config.Image}}' "${name}" 2>/dev/null | sed 's/.*://' || true)"
+  fi
+  printf "%s" "${ver:-?}"
+}
+
+_extract_host_port() {
+  # Pull host port from the ports field: "0.0.0.0:8080->80/tcp, ..."
+  printf "%s" "$1" | grep -o ':[0-9]*->80' | head -n1 | cut -d':' -f2 || true
+}
+
+show_status() {
+  require_docker_socket
+  local rows
+  rows="$(_umbrel_containers)"
+
+  if [[ -z "${rows}" ]]; then
+    info "No Umbrel containers found."
+    return 0
+  fi
+
+  printf "\n%s  %-22s %-15s %-10s %-8s %-s%s\n" \
+    "${C_BOLD}" "CONTAINER" "VERSION" "STATUS" "PORT" "IMAGE" "${C_RESET}"
+  printf "  %s\n" "$(printf '─%.0s' {1..75})"
+
+  local name image status ports ver port state_col
+  while IFS='|' read -r name image status ports; do
+    ver="$(_container_version "${name}")"
+    port="$(_extract_host_port "${ports}")"
+    [[ -z "${port}" ]] && port="-"
+
+    if printf "%s" "${status}" | grep -qi '^up'; then
+      state_col="${C_GREEN}"
+    else
+      state_col="${C_RED}"
+    fi
+
+    printf "  %-22s %-15s %s%-10s%s %-8s %s%s%s\n" \
+      "${name}" "${ver}" \
+      "${state_col}" "$(printf "%s" "${status}" | grep -qi '^up' && echo 'running' || echo 'stopped')" "${C_RESET}" \
+      "${port}" \
+      "${C_DIM}" "${image}" "${C_RESET}"
+  done <<< "${rows}"
+  printf "\n"
+}
+
+# ── logs ──────────────────────────────────────────────────────────────────────
+show_logs() {
+  require_docker_socket
+  if ! container_exists; then
+    err "Container '${CONTAINER_NAME}' not found."
+    exit 1
+  fi
+  if [[ "${FOLLOW_LOGS}" == "true" ]]; then
+    docker logs -f --tail "${LOGS_TAIL}" "${CONTAINER_NAME}"
+  else
+    docker logs --tail "${LOGS_TAIL}" "${CONTAINER_NAME}"
+  fi
+}
+
+# ── shell ─────────────────────────────────────────────────────────────────────
+open_shell() {
+  require_docker_socket
+  if ! container_exists; then
+    err "Container '${CONTAINER_NAME}' not found."
+    exit 1
+  fi
+  local running
+  running="$(docker inspect -f '{{.State.Running}}' "${CONTAINER_NAME}" 2>/dev/null || echo false)"
+  if [[ "${running}" != "true" ]]; then
+    err "Container '${CONTAINER_NAME}' is not running."
+    exit 1
+  fi
+  local tty_flags=(-i)
+  [[ -t 0 && -t 1 ]] && tty_flags=(-it)
+  docker exec "${tty_flags[@]}" "${CONTAINER_NAME}" bash
+}
+
+# ── open ──────────────────────────────────────────────────────────────────────
+open_browser() {
+  require_docker_socket
+  if ! container_exists; then
+    err "Container '${CONTAINER_NAME}' not found. Start it first with './umbrelctl up'."
+    exit 1
+  fi
+  local port
+  port="$(docker port "${CONTAINER_NAME}" 80/tcp 2>/dev/null | head -n1 | sed 's/.*://' || echo "${HOST_PORT}")"
+  [[ -z "${port}" ]] && port="${HOST_PORT}"
+  local url="http://localhost:${port}"
+  info "Opening ${url}"
+  if command -v open >/dev/null 2>&1; then
+    open "${url}"
+  elif command -v xdg-open >/dev/null 2>&1; then
+    xdg-open "${url}"
+  else
+    info "Cannot auto-open browser. Visit: ${url}"
+  fi
+}
+
+# ── backups ───────────────────────────────────────────────────────────────────
+backups_list() {
+  local bdir="${BACKUP_DIR:-$(default_backup_dir)}"
+  if [[ ! -d "${bdir}" ]]; then
+    info "No backups directory found at ${bdir}"
+    return 0
+  fi
+
+  local entries
+  entries="$(ls -1 "${bdir}" 2>/dev/null | sort -r || true)"
+  if [[ -z "${entries}" ]]; then
+    info "No backups found in ${bdir}"
+    return 0
+  fi
+
+  printf "\n%s  %-40s %-10s %-s%s\n" \
+    "${C_BOLD}" "BACKUP" "SIZE" "MODIFIED" "${C_RESET}"
+  printf "  %s\n" "$(printf '─%.0s' {1..70})"
+
+  local entry path archive size mtime
+  while IFS= read -r entry; do
+    path="${bdir}/${entry}"
+    archive="${path}/umbrel-data.tar"
+    if [[ -f "${archive}" ]]; then
+      size="$(du -sh "${archive}" 2>/dev/null | cut -f1 || echo '?')"
+      mtime="$(file_mtime "${archive}")"
+      printf "  %-40s %-10s %s\n" "${entry}" "${size}" "${mtime}"
+    fi
+  done <<< "${entries}"
+  printf "\n  Location: %s\n\n" "${bdir}"
+}
+
+backups_prune() {
+  if ! [[ "${BACKUPS_KEEP}" =~ ^[0-9]+$ ]] || (( BACKUPS_KEEP < 1 )); then
+    err "--keep must be an integer >= 1"
+    exit 1
+  fi
+
+  local bdir="${BACKUP_DIR:-$(default_backup_dir)}"
+  if [[ ! -d "${bdir}" ]]; then
+    info "No backups directory at ${bdir}"
+    return 0
+  fi
+
+  local all_entries total
+  all_entries="$(ls -1 "${bdir}" 2>/dev/null | sort -r || true)"
+  total="$(printf "%s\n" "${all_entries}" | grep -c . || true)"
+
+  if (( total <= BACKUPS_KEEP )); then
+    info "Nothing to prune (${total} backup(s) present, keeping ${BACKUPS_KEEP})."
+    return 0
+  fi
+
+  local to_delete
+  to_delete="$(printf "%s\n" "${all_entries}" | tail -n +"$(( BACKUPS_KEEP + 1 ))")"
+
+  local entry
+  while IFS= read -r entry; do
+    if [[ -n "${entry}" && -d "${bdir}/${entry}" ]]; then
+      info "Removing: ${entry}"
+      rm -rf "${bdir:?}/${entry}"
+    fi
+  done <<< "${to_delete}"
+
+  ok "Pruned to ${BACKUPS_KEEP} most recent backup(s)."
+}
+
+backups_restore() {
+  local path="$1"
+  if [[ -z "${path}" ]]; then
+    err "Usage: ./umbrelctl backups restore <backup-name-or-path>"
+    info "Run './umbrelctl backups list' to see available backups."
+    exit 1
+  fi
+
+  # Resolve the archive file
+  local archive=""
+  local bdir="${BACKUP_DIR:-$(default_backup_dir)}"
+  if [[ -f "${path}/umbrel-data.tar" ]]; then
+    archive="${path}/umbrel-data.tar"
+  elif [[ -f "${path}" && "${path}" == *.tar ]]; then
+    archive="${path}"
+  elif [[ -f "${bdir}/${path}/umbrel-data.tar" ]]; then
+    archive="${bdir}/${path}/umbrel-data.tar"
+  else
+    err "Cannot find backup archive for: ${path}"
+    info "Run './umbrelctl backups list' to see available backups."
+    exit 1
+  fi
+
+  info "Restoring from: ${archive}"
+  warn "This will OVERWRITE your current data directory: ${DATA_DIR}"
+
+  if [[ "${FORCE_UPDATE}" != "true" ]]; then
+    printf "  Type 'yes' to confirm: "
+    local confirm
+    read -r confirm
+    if [[ "${confirm}" != "yes" ]]; then
+      info "Restore cancelled."
+      return 0
+    fi
+  fi
+
+  # Stop container if running
+  local was_running="false"
+  if container_exists; then
+    local running
+    running="$(docker inspect -f '{{.State.Running}}' "${CONTAINER_NAME}" 2>/dev/null || echo false)"
+    if [[ "${running}" == "true" ]]; then
+      was_running="true"
+      info "Stopping container ${CONTAINER_NAME}"
+      docker stop --time "${STOP_TIMEOUT}" "${CONTAINER_NAME}" >/dev/null
+    fi
+  fi
+
+  info "Extracting archive..."
+  local tmp_dir
+  tmp_dir="$(mktemp -d)"
+  local _restore_cleanup_done="false"
+  _restore_cleanup() {
+    [[ "${_restore_cleanup_done}" == "true" ]] && return
+    _restore_cleanup_done="true"
+    rm -rf "${tmp_dir}"
+  }
+  trap '_restore_cleanup' RETURN ERR
+
+  tar -xf "${archive}" -C "${tmp_dir}"
+
+  local extracted
+  extracted="$(ls -1 "${tmp_dir}" | head -n1)"
+  if [[ -z "${extracted}" ]]; then
+    err "Archive appears to be empty."
+    exit 1
+  fi
+
+  mkdir -p "${DATA_DIR}"
+  info "Syncing to ${DATA_DIR}"
+  rsync -a --delete "${tmp_dir}/${extracted}/" "${DATA_DIR}/"
+
+  _restore_cleanup
+  trap - RETURN ERR
+
+  ok "Restore completed to ${DATA_DIR}"
+
+  if [[ "${was_running}" == "true" ]]; then
+    info "Restarting container ${CONTAINER_NAME}"
+    docker start "${CONTAINER_NAME}" >/dev/null
+    ok "Container restarted."
+  fi
+}
+
+# ── config ────────────────────────────────────────────────────────────────────
+config_show() {
+  local valid_keys=(REF CONTAINER_NAME DATA_DIR HOST_PORT STOP_TIMEOUT
+    RUNTIME_PROFILE RELEASE_CHANNEL HEALTH_TIMEOUT BACKUP_DIR
+    BACKUP_ENABLED BACKUPS_KEEP)
+
+  printf "\n%sEffective configuration%s" "${C_BOLD}" "${C_RESET}"
+  if [[ -f "${CONFIG_FILE}" ]]; then
+    printf " %s(from %s)%s" "${C_DIM}" "${CONFIG_FILE}" "${C_RESET}"
+  fi
+  printf "\n\n"
+
+  local key val file_val="?"
+  for key in "${valid_keys[@]}"; do
+    val="${!key:-}"
+    local in_file="false"
+    [[ -f "${CONFIG_FILE}" ]] && grep -q "^${key}=" "${CONFIG_FILE}" 2>/dev/null && in_file="true"
+
+    local source_hint=""
+    [[ "${in_file}" == "true" ]] && source_hint="${C_GREEN}[config]${C_RESET}"
+
+    printf "  %-22s %s%-30s%s %s\n" \
+      "${key}" "${C_CYAN}" "${val}" "${C_RESET}" "${source_hint}"
+  done
+
+  printf "\n  Config file: %s\n" "${CONFIG_FILE}"
+  if [[ ! -f "${CONFIG_FILE}" ]]; then
+    printf "  %s(no config file — run './umbrelctl config set KEY VALUE' to create one)%s\n" \
+      "${C_DIM}" "${C_RESET}"
+  fi
+  printf "\n"
+}
+
+config_set() {
+  local key="$1" value="$2"
+  if [[ -z "${key}" || -z "${value}" ]]; then
+    err "Usage: ./umbrelctl config set KEY VALUE"
+    exit 1
+  fi
+  local valid_keys=(REF CONTAINER_NAME DATA_DIR HOST_PORT STOP_TIMEOUT
+    RUNTIME_PROFILE RELEASE_CHANNEL HEALTH_TIMEOUT BACKUP_DIR
+    BACKUP_ENABLED BACKUPS_KEEP)
+  local k valid="false"
+  for k in "${valid_keys[@]}"; do
+    [[ "${k}" == "${key}" ]] && valid="true" && break
+  done
+  if [[ "${valid}" != "true" ]]; then
+    err "Unknown config key: ${key}"
+    printf "  Valid keys: %s\n" "${valid_keys[*]}"
+    exit 1
+  fi
+  save_config_key "${key}" "${value}"
+  ok "Set ${key}=${value} in ${CONFIG_FILE}"
+}
+
+config_unset() {
+  local key="$1"
+  if [[ -z "${key}" ]]; then
+    err "Usage: ./umbrelctl config unset KEY"
+    exit 1
+  fi
+  remove_config_key "${key}"
+  ok "Removed ${key} from ${CONFIG_FILE}"
+}
+
+# ── agent management ───────────────────────────────────────────────────────────
+_agent_pid_file() {
+  printf "%s/.umbrel-docker/update-agent.pid" "${DATA_DIR}"
+}
+
+_agent_log_file() {
+  if [[ -n "${AGENT_LOG_FILE}" ]]; then
+    printf "%s" "${AGENT_LOG_FILE}"
+  else
+    printf "%s/.umbrel-docker/update-agent.log" "${DATA_DIR}"
+  fi
+}
+
+agent_status() {
+  local pid_file
+  pid_file="$(_agent_pid_file)"
+
+  if [[ ! -f "${pid_file}" ]]; then
+    info "Agent is not running (no PID file at ${pid_file})"
+    return 0
+  fi
+
+  local pid
+  pid="$(cat "${pid_file}" 2>/dev/null || true)"
+  if [[ -z "${pid}" ]]; then
+    warn "PID file exists but is empty: ${pid_file}"
+    return 0
+  fi
+
+  if kill -0 "${pid}" 2>/dev/null; then
+    ok "Agent is running (PID ${pid})"
+    local log_file
+    log_file="$(_agent_log_file)"
+    [[ -f "${log_file}" ]] && info "Log: ${log_file}"
+  else
+    warn "Stale PID file — process ${pid} is not running."
+    info "Run './umbrelctl agent stop' to clean up."
+  fi
+}
+
+agent_stop() {
+  local pid_file
+  pid_file="$(_agent_pid_file)"
+
+  if [[ ! -f "${pid_file}" ]]; then
+    info "No agent PID file found at ${pid_file}"
+    return 0
+  fi
+
+  local pid
+  pid="$(cat "${pid_file}" 2>/dev/null || true)"
+  if [[ -z "${pid}" ]]; then
+    warn "PID file is empty, removing it."
+    rm -f "${pid_file}"
+    return 0
+  fi
+
+  if kill -0 "${pid}" 2>/dev/null; then
+    info "Stopping agent (PID ${pid})..."
+    kill "${pid}" 2>/dev/null || true
+    local i=0
+    while kill -0 "${pid}" 2>/dev/null && (( i < 10 )); do
+      sleep 1; (( i++ ))
+    done
+    if kill -0 "${pid}" 2>/dev/null; then
+      warn "Agent did not stop gracefully — sending SIGKILL"
+      kill -9 "${pid}" 2>/dev/null || true
+    fi
+    ok "Agent stopped."
+  else
+    info "Process ${pid} is not running. Cleaning up stale PID file."
+  fi
+  rm -f "${pid_file}"
+}
+
+agent_logs() {
+  local log_file
+  log_file="$(_agent_log_file)"
+  if [[ ! -f "${log_file}" ]]; then
+    info "No agent log file at ${log_file}"
+    info "Start the agent first: ./umbrelctl agent start --daemon"
+    return 0
+  fi
+  if [[ "${FOLLOW_LOGS}" == "true" ]]; then
+    tail -f "${log_file}"
+  else
+    tail -n "${LOGS_TAIL}" "${log_file}"
+  fi
+}
+
+run_update_agent() {
+  local agent_script="${SCRIPT_DIR}/scripts/umbrel-update-agent.sh"
+  if [[ ! -x "${agent_script}" ]]; then
+    err "Agent script not found or not executable: ${agent_script}"
+    exit 1
+  fi
+
+  if [[ "${DATA_DIR_SET}" != "true" ]] && container_exists; then
+    require_docker_socket
+    require_jq
+    local inspect_file
+    inspect_file="$(mktemp)"
+    trap 'rm -f "${inspect_file:-}"' RETURN
+    capture_container_inspect "${inspect_file}"
+    infer_data_dir_from_inspect "${inspect_file}"
+    rm -f "${inspect_file}"
+    trap - RETURN
+  fi
+
+  local -a args
+  args=(
+    --name "${CONTAINER_NAME}"
+    --data-dir "${DATA_DIR}"
+    --poll-interval "${AGENT_POLL_INTERVAL}"
+  )
+  [[ "${AGENT_ONCE}"   == "true" ]] && args+=(--once)
+  [[ "${AGENT_DAEMON}" == "true" ]] && args+=(--daemon)
+  [[ -n "${AGENT_LOG_FILE}" ]]      && args+=(--log-file "${AGENT_LOG_FILE}")
+
+  bash "${agent_script}" "${args[@]}"
+}
+
+# ── versions ──────────────────────────────────────────────────────────────────
+list_versions() {
+  if ! command -v git >/dev/null 2>&1; then
+    warn "git not found; using local version discovery only."
+  fi
+
+  if ! [[ "${LIST_LIMIT}" =~ ^[0-9]+$ ]]; then
+    err "--limit must be a non-negative integer."
+    exit 1
+  fi
+
+  local remote refs refs_remote refs_local
+  remote="https://github.com/getumbrel/umbrel.git"
+  refs_remote="$(git ls-remote --tags --refs "${remote}" 2>/dev/null | awk '{print $2}' | sed 's#refs/tags/##' || true)"
+  refs_local="$(
+    find "$(dirname "${SCRIPT_DIR}")" -maxdepth 1 -type d -name 'umbrel-*' 2>/dev/null \
+    | sed 's#.*/umbrel-##' \
+    || true
+  )"
+  refs="$(printf "%s\n%s\n" "${refs_remote}" "${refs_local}" | sed '/^$/d' | sed 's/^v//' | sort -u)"
+  if [[ -z "${refs}" ]]; then
+    err "No installable versions found (remote tags unavailable and no local umbrel-* folders detected)."
+    exit 1
+  fi
+
+  if [[ "${LIST_ALL_REFS}" != "true" ]]; then
+    refs="$(printf "%s\n" "${refs}" | grep -E '^[0-9]+\.[0-9]+\.[0-9]+(-patch-[0-9]+)?$' || true)"
+  else
+    refs="$(printf "%s\n" "${refs}" | grep -E '^[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.-]+)?$' || true)"
+  fi
+
+  refs="$(printf "%s\n" "${refs}" | sed '/^$/d' | sort -uV | reverse_lines)"
+  if [[ -z "${refs}" ]]; then
+    warn "No refs matched current filter."
+    exit 0
+  fi
+
+  if [[ "${LIST_LIMIT}" != "0" ]]; then
+    refs="$(printf "%s\n" "${refs}" | head -n "${LIST_LIMIT}")"
+  fi
+
+  printf "%s\n" "${refs}"
+}
+
+# ── update helpers ─────────────────────────────────────────────────────────────
+capture_container_inspect() {
+  local out_file="$1"
+  docker inspect "${CONTAINER_NAME}" > "${out_file}"
+}
+
+infer_data_dir_from_inspect() {
+  local inspect_file="$1"
+  local discovered_data_dir
+  discovered_data_dir="$(jq -r '.[0].Mounts[]? | select(.Destination == "/data") | .Source' "${inspect_file}" | head -n1)"
+  if [[ -n "${discovered_data_dir}" && "${discovered_data_dir}" != "null" ]]; then
+    DATA_DIR="${discovered_data_dir}"
+  fi
+}
+
+backup_data_dir() {
+  [[ "$BACKUP_ENABLED" != "true" ]] && return 0
+
+  if [[ -z "$BACKUP_DIR" ]]; then
+    BACKUP_DIR="$(default_backup_dir)"
+  fi
+  mkdir -p "${BACKUP_DIR}"
+
+  local ts
+  ts="$(date '+%Y%m%d-%H%M%S')"
+  local old_image_sanitized
+  old_image_sanitized="$(sanitize_ref_for_tag "${OLD_IMAGE}")"
+  BACKUP_PATH="${BACKUP_DIR}/${ts}-${old_image_sanitized}"
+  mkdir -p "${BACKUP_PATH}"
+
+  info "Creating backup of ${DATA_DIR}"
+  local data_basename snapshot_root snapshot_data rsync_log tar_log rsync_rc
+  data_basename="$(basename "${DATA_DIR}")"
+  snapshot_root="$(mktemp -d)"
+  snapshot_data="${snapshot_root}/${data_basename}"
+  rsync_log="${BACKUP_PATH}/backup-rsync.log"
+  tar_log="${BACKUP_PATH}/backup-tar.log"
+  mkdir -p "${snapshot_data}"
+
+  set +e
+  rsync -a --delete "${DATA_DIR}/" "${snapshot_data}/" > /dev/null 2>"${rsync_log}"
+  rsync_rc=$?
+  set -e
+
+  if (( rsync_rc != 0 && rsync_rc != 24 )); then
+    cat "${rsync_log}" >&2
+    rm -rf "${snapshot_root}"
+    err "Backup snapshot failed (rsync exit code ${rsync_rc})."
+    exit 1
+  fi
+  if (( rsync_rc == 24 )); then
+    warn "Backup snapshot completed with transient file-change warnings (rsync exit code 24)."
+    sed 's/^/WARN: /' "${rsync_log}" >&2
+  else
+    rm -f "${rsync_log}"
+  fi
+
+  if ! tar -C "${snapshot_root}" -cf "${BACKUP_PATH}/umbrel-data.tar" "${data_basename}" 2>"${tar_log}"; then
+    cat "${tar_log}" >&2
+    rm -rf "${snapshot_root}"
+    err "Backup archive creation failed."
+    exit 1
+  fi
+
+  rm -rf "${snapshot_root}"
+  rm -f "${tar_log}"
+  if [[ ! -s "${BACKUP_PATH}/umbrel-data.tar" ]]; then
+    err "Backup archive is empty."
+    exit 1
+  fi
+  info "Backup created at ${BACKUP_PATH}"
+}
+
+build_docker_run_args_from_inspect() {
+  local inspect_file="$1"
+  RESTORE_ARGS=()
+
+  RESTORE_ARGS+=(--name "${CONTAINER_NAME}")
+
+  local pid_mode
+  pid_mode="$(jq -r '.[0].HostConfig.PidMode // empty' "${inspect_file}")"
+  [[ -n "$pid_mode" ]] && RESTORE_ARGS+=(--pid="${pid_mode}")
+
+  local has_sys_admin="false"
+  mapfile -t cap_adds < <(jq -r '.[0].HostConfig.CapAdd[]?' "${inspect_file}")
+  for cap in "${cap_adds[@]}"; do
+    RESTORE_ARGS+=(--cap-add "${cap}")
+    [[ "${cap}" == "SYS_ADMIN" ]] && has_sys_admin="true"
+  done
+  [[ "${has_sys_admin}" != "true" ]] && RESTORE_ARGS+=(--cap-add SYS_ADMIN)
+
+  mapfile -t binds < <(jq -r '.[0].HostConfig.Binds[]?' "${inspect_file}")
+  for bind in "${binds[@]}"; do
+    RESTORE_ARGS+=(-v "${bind}")
+  done
+
+  mapfile -t envs < <(jq -r '.[0].Config.Env[]?' "${inspect_file}")
+  for env in "${envs[@]}"; do
+    case "$env" in
+      PATH=*|HOSTNAME=*|HOME=*|TERM=*|container=*|SHLVL=*|PWD=*) continue ;;
+    esac
+    RESTORE_ARGS+=(-e "${env}")
+  done
+  [[ "${RUNTIME_PROFILE_SET}" == "true" ]] && RESTORE_ARGS+=(-e "UMBREL_RUNTIME_PROFILE=${RUNTIME_PROFILE}")
+  [[ "${RELEASE_CHANNEL_SET}" == "true" ]]  && RESTORE_ARGS+=(-e "UMBREL_RELEASE_CHANNEL=${RELEASE_CHANNEL}")
+
+  mapfile -t ports < <(jq -r '.[0].HostConfig.PortBindings | to_entries[]? | .key + "|" + (.value[0].HostPort // "") + "|" + (.value[0].HostIp // "")' "${inspect_file}")
+  for entry in "${ports[@]}"; do
+    local container_proto host_port host_ip container_port
+    container_proto="${entry%%|*}"
+    host_port="$(printf "%s" "${entry}" | cut -d'|' -f2)"
+    host_ip="$(printf "%s" "${entry}" | cut -d'|' -f3)"
+    container_port="${container_proto%/*}"
+    [[ -z "$host_port" ]] && continue
+    if [[ -n "$host_ip" && "$host_ip" != "0.0.0.0" ]]; then
+      RESTORE_ARGS+=(-p "${host_ip}:${host_port}:${container_port}")
+    else
+      RESTORE_ARGS+=(-p "${host_port}:${container_port}")
+    fi
+  done
+
+  local restart_name restart_max
+  restart_name="$(jq -r '.[0].HostConfig.RestartPolicy.Name // empty' "${inspect_file}")"
+  restart_max="$(jq -r '.[0].HostConfig.RestartPolicy.MaximumRetryCount // 0' "${inspect_file}")"
+  if [[ -n "$restart_name" && "$restart_name" != "no" ]]; then
+    if [[ "$restart_name" == "on-failure" ]]; then
+      RESTORE_ARGS+=(--restart "${restart_name}:${restart_max}")
+    else
+      RESTORE_ARGS+=(--restart "${restart_name}")
+    fi
+  fi
+
+  local stop_t
+  stop_t="$(jq -r '.[0].Config.StopTimeout // empty' "${inspect_file}")"
+  if [[ -n "$stop_t" ]]; then
+    RESTORE_ARGS+=(--stop-timeout "${stop_t}")
+  else
+    RESTORE_ARGS+=(--stop-timeout "${STOP_TIMEOUT}")
+  fi
+
+  append_host_sensor_binds RESTORE_ARGS
+}
+
+wait_healthy() {
+  local timeout="$1"
+  local start elapsed stable_since
+  start="$(date +%s)"
+  stable_since=""
+  while true; do
+    local running logs now state status exit_code restarting rest
+    now="$(date +%s)"
+    elapsed="$(( now - start ))"
+    if (( elapsed >= timeout )); then
+      return 1
+    fi
+
+    running="$(docker inspect -f '{{.State.Running}}' "${CONTAINER_NAME}" 2>/dev/null || printf "false")"
+    state="$(docker inspect -f '{{.State.Status}}|{{.State.ExitCode}}|{{.State.Restarting}}' "${CONTAINER_NAME}" 2>/dev/null || printf "missing|-1|false")"
+    status="${state%%|*}"
+    rest="${state#*|}"
+    exit_code="${rest%%|*}"
+    restarting="${state##*|}"
+    logs="$(docker logs --tail 300 "${CONTAINER_NAME}" 2>&1 || true)"
+    if [[ "${status}" == "missing" || "${status}" == "exited" || "${status}" == "dead" ]] && [[ "${restarting}" != "true" ]]; then
+      return 1
+    fi
+    if printf "%s" "$logs" | grep -Eq "Failed to start app environment|\\[escapes-base\\]|Cannot find module|SyntaxError|Failed to ensure directory|Failed to watch directory|Failed to apply shares|Failed to start external storage"; then
+      return 1
+    fi
+
+    if [[ "$running" == "true" ]]; then
+      if printf "%s" "$logs" | grep -Eq "Listening on port|Starting backups"; then
+        return 0
+      fi
+      if [[ -z "${stable_since}" ]]; then
+        stable_since="${now}"
+      elif (( now - stable_since >= 15 )); then
+        return 0
+      fi
+    else
+      stable_since=""
+    fi
+    sleep 2
+  done
+}
+
+rollback() {
+  warn "Update failed. Rolling back to ${OLD_IMAGE}"
+  docker rm -f "${CONTAINER_NAME}" >/dev/null 2>&1 || true
+  docker run -d "${RESTORE_ARGS[@]}" "${OLD_IMAGE}" >/dev/null
+  warn "Rollback completed."
+  [[ -n "${BACKUP_PATH:-}" ]] && warn "Backup is available at ${BACKUP_PATH}"
+}
+
+update_container() {
+  require_docker_socket
+  require_jq
+  validate_runtime_profile
+  validate_release_channel
+
+  if ! container_exists; then
+    err "Container ${CONTAINER_NAME} does not exist. Start it first with './umbrelctl up ...'"
+    exit 1
+  fi
+
+  local inspect_file
+  inspect_file="$(mktemp)"
+  trap 'rm -f "${inspect_file:-}"' EXIT
+  capture_container_inspect "${inspect_file}"
+
+  OLD_IMAGE="$(jq -r '.[0].Config.Image' "${inspect_file}")"
+  if [[ "${DATA_DIR_SET}" != "true" ]]; then
+    infer_data_dir_from_inspect "${inspect_file}"
+  fi
+  build_docker_run_args_from_inspect "${inspect_file}"
+  ensure_image_default
+
+  if [[ "${FORCE_UPDATE}" != "true" && "${OLD_IMAGE}" == "${IMAGE}" ]]; then
+    info "Current image (${OLD_IMAGE}) already matches target (${IMAGE}); nothing to do."
+    info "Use --force to rebuild/recreate anyway."
+    return 0
+  fi
+
+  backup_data_dir
+  resolve_target_image
+
+  info "Stopping old container ${CONTAINER_NAME}"
+  docker rm -f "${CONTAINER_NAME}" >/dev/null
+
+  info "Starting new container from ${IMAGE}"
+  docker run -d "${RESTORE_ARGS[@]}" "${IMAGE}" >/dev/null
+
+  if ! wait_healthy "${HEALTH_TIMEOUT}"; then
+    rollback
+    exit 1
+  fi
+
+  info "Updated ${CONTAINER_NAME} from ${OLD_IMAGE} to ${IMAGE}"
+  [[ -n "${BACKUP_PATH:-}" ]] && info "Backup kept at ${BACKUP_PATH}"
+  if [[ "$FOLLOW_LOGS" == "true" ]]; then
+    docker logs -f "${CONTAINER_NAME}"
+  fi
+}
+
+# ── main ──────────────────────────────────────────────────────────────────────
+main() {
+  local command="${1:-help}"
+  shift || true
+
+  # Extract subcommand for multi-level commands before parse_options sees them
+  case "${command}" in
+    agent|backups|config)
+      if [[ $# -gt 0 && "${1:0:1}" != "-" ]]; then
+        SUBCOMMAND="$1"
+        shift
+      fi
+      ;;
+  esac
+
+  # Positional argument for 'backups restore <path>'
+  local RESTORE_PATH=""
+  if [[ "${command}" == "backups" && "${SUBCOMMAND}" == "restore" && $# -gt 0 && "${1:0:1}" != "-" ]]; then
+    RESTORE_PATH="$1"
+    shift
+  fi
+
+  # Positional arguments for 'config set KEY VALUE' and 'config unset KEY'
+  local CONFIG_SET_KEY="" CONFIG_SET_VAL=""
+  if [[ "${command}" == "config" && "${SUBCOMMAND}" == "set" && $# -ge 2 ]]; then
+    CONFIG_SET_KEY="$1"; shift
+    CONFIG_SET_VAL="$1"; shift
+  fi
+  if [[ "${command}" == "config" && "${SUBCOMMAND}" == "unset" && $# -ge 1 ]]; then
+    CONFIG_SET_KEY="$1"; shift
+  fi
+
+  parse_options "$@"
+
+  case "${command}" in
+    build)    build_image ;;
+    up)       up_container ;;
+    down)     down_container ;;
+    update)   update_container ;;
+    versions) list_versions ;;
+    status)   show_status ;;
+    logs)     show_logs ;;
+    shell)    open_shell ;;
+    open)     open_browser ;;
+    check)    check_env ;;
+    agent)
+      case "${SUBCOMMAND:-start}" in
+        start)  run_update_agent ;;
+        status) agent_status ;;
+        stop)   agent_stop ;;
+        logs)   agent_logs ;;
+        *) err "Unknown agent subcommand: ${SUBCOMMAND}"; usage; exit 1 ;;
+      esac
+      ;;
+    backups)
+      case "${SUBCOMMAND:-list}" in
+        list)    backups_list ;;
+        prune)   backups_prune ;;
+        restore) backups_restore "${RESTORE_PATH}" ;;
+        *) err "Unknown backups subcommand: ${SUBCOMMAND}"; usage; exit 1 ;;
+      esac
+      ;;
+    config)
+      case "${SUBCOMMAND:-show}" in
+        show)  config_show ;;
+        set)   config_set "${CONFIG_SET_KEY}" "${CONFIG_SET_VAL}" ;;
+        unset) config_unset "${CONFIG_SET_KEY}" ;;
+        *) err "Unknown config subcommand: ${SUBCOMMAND}"; usage; exit 1 ;;
+      esac
+      ;;
+    help|-h|--help) usage ;;
+    *) err "Unknown command: ${command}"; usage; exit 1 ;;
+  esac
+}
+
+main "$@"
