@@ -206,7 +206,7 @@ The host update agent watches that file and runs `umbrelctl update` on the host:
 ./umbrelctl agent stop
 ```
 
-The agent stores state and logs in `<data-dir>/.umbrel-docker/`.
+The agent stores state and logs in `<data-dir>/.umbrel-docker/`. During a UI-triggered update, the host updater shows live backup progress and writes the same progress to `update-state.json` while it snapshots and archives the data directory.
 
 ### Backups
 
@@ -217,7 +217,7 @@ The agent stores state and logs in `<data-dir>/.umbrel-docker/`.
 ./umbrelctl backups restore /absolute/path/to/backup --force
 ```
 
-Backups are tar archives created from an rsync snapshot of the data directory. Restore stops the container if needed, overwrites the data directory, and restarts the container if it was previously running.
+Backups are tar archives created from an rsync snapshot of the data directory. `umbrelctl update` shows snapshot and archive progress by comparing copied/archive size against the measured data size. Restore stops the container if needed, overwrites the data directory, and restarts the container if it was previously running.
 
 ## Configuration
 
@@ -264,6 +264,7 @@ Supported keys:
 The test harness can build versions, start containers, perform upgrades, verify health, and collect logs:
 
 ```bash
+bash ./tests/backup-progress.sh
 bash ./tests/upgrade-matrix.sh --help
 bash ./tests/upgrade-matrix.sh --mode smoke
 bash ./tests/upgrade-matrix.sh --mode full --min-version 1.0.0 --include-prerelease true
@@ -335,6 +336,7 @@ Make sure the configured data directory exists and is writable by the user runni
 | [`umbrelctl`](umbrelctl) | Main host-side CLI. |
 | [`scripts/patch-umbrel.js`](scripts/patch-umbrel.js) | Build-time patches applied to upstream Umbrel source. |
 | [`scripts/umbrel-update-agent.sh`](scripts/umbrel-update-agent.sh) | Host daemon for UI-triggered updates. |
+| [`tests/backup-progress.sh`](tests/backup-progress.sh) | Focused backup progress/state-file test. |
 | [`tests/upgrade-matrix.sh`](tests/upgrade-matrix.sh) | End-to-end upgrade matrix runner. |
 
 ## License

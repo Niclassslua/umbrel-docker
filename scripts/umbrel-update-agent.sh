@@ -160,6 +160,9 @@ process_request_file() {
   write_state true 10 "Running host update to ${version}" "" "${version}" "${channel}"
 
   set +e
+  UMBREL_UPDATE_STATE_FILE="${STATE_FILE}" \
+  UMBREL_UPDATE_VERSION="${version}" \
+  UMBREL_UPDATE_CHANNEL="${channel}" \
   bash "${UMBRELCTL}" update \
     --name "${CONTAINER_NAME}" \
     --data-dir "${DATA_DIR}" \

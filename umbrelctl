@@ -293,6 +293,126 @@ require_jq() {
   fi
 }
 
+size_kib() {
+  local path="$1" size
+  if [[ ! -e "${path}" ]]; then
+    printf "0"
+    return 0
+  fi
+
+  size="$(du -sk "${path}" 2>/dev/null | awk 'NR == 1 {print $1}' || true)"
+  [[ "${size}" =~ ^[0-9]+$ ]] || size="0"
+  printf "%s" "${size}"
+}
+
+percent_from_kib() {
+  local current="$1" total="$2" percent
+  (( total < 1 )) && total=1
+  percent="$(( current * 100 / total ))"
+  (( percent > 100 )) && percent=100
+  printf "%s" "${percent}"
+}
+
+progress_in_range() {
+  local start="$1" end="$2" percent="$3"
+  (( percent < 0 )) && percent=0
+  (( percent > 100 )) && percent=100
+  printf "%s" "$(( start + ((end - start) * percent / 100) ))"
+}
+
+print_backup_progress() {
+  local description="$1" percent="$2"
+  if [[ -t 1 ]]; then
+    printf "\r%s==>%s %s: %3s%%" "${C_CYAN}" "${C_RESET}" "${description}" "${percent}"
+  else
+    info "${description}: ${percent}%"
+  fi
+}
+
+finish_backup_progress() {
+  local description="$1"
+  if [[ -t 1 ]]; then
+    printf "\r%s==>%s %s: 100%%\n" "${C_CYAN}" "${C_RESET}" "${description}"
+  else
+    info "${description}: 100%"
+  fi
+}
+
+newline_after_backup_progress() {
+  [[ -t 1 ]] && printf "\n"
+}
+
+write_update_state() {
+  [[ -z "${UMBREL_UPDATE_STATE_FILE:-}" ]] && return 0
+  command -v jq >/dev/null 2>&1 || return 0
+
+  local running="$1"
+  local progress="$2"
+  local description="$3"
+  local error="${4:-}"
+  local version="${UMBREL_UPDATE_VERSION:-${REF:-}}"
+  local channel="${UMBREL_UPDATE_CHANNEL:-${RELEASE_CHANNEL:-}}"
+  local state_dir tmp
+
+  [[ "${progress}" =~ ^[0-9]+$ ]] || progress=0
+  (( progress > 100 )) && progress=100
+
+  state_dir="$(dirname "${UMBREL_UPDATE_STATE_FILE}")"
+  mkdir -p "${state_dir}" 2>/dev/null || return 0
+  tmp="$(mktemp "${UMBREL_UPDATE_STATE_FILE}.tmp.XXXXXX" 2>/dev/null || true)"
+  [[ -n "${tmp}" ]] || return 0
+
+  if jq -cn \
+    --argjson running "${running}" \
+    --argjson progress "${progress}" \
+    --arg description "${description}" \
+    --arg error "${error}" \
+    --arg version "${version}" \
+    --arg channel "${channel}" \
+    --arg updatedAt "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
+    '{
+      running: $running,
+      progress: $progress,
+      description: $description,
+      error: ($error | if . == "" then false else . end),
+      version: ($version | if . == "" then null else . end),
+      channel: ($channel | if . == "" then null else . end),
+      updatedAt: $updatedAt
+    }' >"${tmp}"; then
+    mv "${tmp}" "${UMBREL_UPDATE_STATE_FILE}" 2>/dev/null || rm -f "${tmp}"
+  else
+    rm -f "${tmp}"
+  fi
+}
+
+monitor_backup_progress() {
+  local path="$1"
+  local total_kib="$2"
+  local start_progress="$3"
+  local end_progress="$4"
+  local description="$5"
+  local current_kib percent progress
+
+  while true; do
+    current_kib="$(size_kib "${path}")"
+    percent="$(percent_from_kib "${current_kib}" "${total_kib}")"
+    (( percent > 99 )) && percent=99
+    progress="$(progress_in_range "${start_progress}" "${end_progress}" "${percent}")"
+    print_backup_progress "${description}" "${percent}"
+    write_update_state true "${progress}" "${description} (${percent}%)" ""
+    sleep 2
+  done
+}
+
+backup_rsync_excludes() {
+  local data_prefix="${DATA_DIR%/}/"
+  local state_file="${UMBREL_UPDATE_STATE_FILE:-}"
+
+  if [[ -n "${state_file}" && "${state_file}" == "${data_prefix}"* ]]; then
+    printf '%s\n' "--exclude=/${state_file#"${data_prefix}"}"
+  fi
+}
+
 required_tools() {
   printf '%s\n' docker git jq rsync
 }
@@ -1147,7 +1267,10 @@ infer_data_dir_from_inspect() {
 }
 
 backup_data_dir() {
-  [[ "$BACKUP_ENABLED" != "true" ]] && return 0
+  if [[ "$BACKUP_ENABLED" != "true" ]]; then
+    write_update_state true 15 "Skipping backup" ""
+    return 0
+  fi
 
   if [[ -z "$BACKUP_DIR" ]]; then
     BACKUP_DIR="$(default_backup_dir)"
@@ -1162,25 +1285,41 @@ backup_data_dir() {
   mkdir -p "${BACKUP_PATH}"
 
   info "Creating backup of ${DATA_DIR}"
-  local data_basename snapshot_root snapshot_data rsync_log tar_log rsync_rc
+  write_update_state true 10 "Measuring backup size" ""
+
+  local data_basename snapshot_root snapshot_data archive_file rsync_log tar_log
+  local source_kib snapshot_kib progress_pid rsync_rc tar_rc
+  local -a rsync_excludes=()
   data_basename="$(basename "${DATA_DIR}")"
   snapshot_root="$(mktemp -d)"
   snapshot_data="${snapshot_root}/${data_basename}"
+  archive_file="${BACKUP_PATH}/umbrel-data.tar"
   rsync_log="${BACKUP_PATH}/backup-rsync.log"
   tar_log="${BACKUP_PATH}/backup-tar.log"
   mkdir -p "${snapshot_data}"
+  source_kib="$(size_kib "${DATA_DIR}")"
+  (( source_kib < 1 )) && source_kib=1
+  mapfile -t rsync_excludes < <(backup_rsync_excludes)
 
   set +e
-  rsync -a --delete "${DATA_DIR}/" "${snapshot_data}/" > /dev/null 2>"${rsync_log}"
+  monitor_backup_progress "${snapshot_data}" "${source_kib}" 12 32 "Creating backup snapshot" &
+  progress_pid=$!
+  rsync -a --delete "${rsync_excludes[@]}" "${DATA_DIR}/" "${snapshot_data}/" > /dev/null 2>"${rsync_log}"
   rsync_rc=$?
+  kill "${progress_pid}" >/dev/null 2>&1 || true
+  wait "${progress_pid}" >/dev/null 2>&1 || true
   set -e
 
   if (( rsync_rc != 0 && rsync_rc != 24 )); then
+    newline_after_backup_progress
     cat "${rsync_log}" >&2
     rm -rf "${snapshot_root}"
+    write_update_state false 0 "Backup snapshot failed" "Backup snapshot failed (rsync exit code ${rsync_rc})"
     err "Backup snapshot failed (rsync exit code ${rsync_rc})."
     exit 1
   fi
+  finish_backup_progress "Creating backup snapshot"
+  write_update_state true 32 "Backup snapshot complete" ""
   if (( rsync_rc == 24 )); then
     warn "Backup snapshot completed with transient file-change warnings (rsync exit code 24)."
     sed 's/^/WARN: /' "${rsync_log}" >&2
@@ -1188,19 +1327,36 @@ backup_data_dir() {
     rm -f "${rsync_log}"
   fi
 
-  if ! tar -C "${snapshot_root}" -cf "${BACKUP_PATH}/umbrel-data.tar" "${data_basename}" 2>"${tar_log}"; then
+  snapshot_kib="$(size_kib "${snapshot_data}")"
+  (( snapshot_kib < 1 )) && snapshot_kib=1
+
+  set +e
+  monitor_backup_progress "${archive_file}" "${snapshot_kib}" 34 45 "Creating backup archive" &
+  progress_pid=$!
+  tar -C "${snapshot_root}" -cf "${archive_file}" "${data_basename}" 2>"${tar_log}"
+  tar_rc=$?
+  kill "${progress_pid}" >/dev/null 2>&1 || true
+  wait "${progress_pid}" >/dev/null 2>&1 || true
+  set -e
+
+  if (( tar_rc != 0 )); then
+    newline_after_backup_progress
     cat "${tar_log}" >&2
     rm -rf "${snapshot_root}"
+    write_update_state false 0 "Backup archive creation failed" "Backup archive creation failed"
     err "Backup archive creation failed."
     exit 1
   fi
+  finish_backup_progress "Creating backup archive"
 
   rm -rf "${snapshot_root}"
   rm -f "${tar_log}"
-  if [[ ! -s "${BACKUP_PATH}/umbrel-data.tar" ]]; then
+  if [[ ! -s "${archive_file}" ]]; then
+    write_update_state false 0 "Backup archive is empty" "Backup archive is empty"
     err "Backup archive is empty."
     exit 1
   fi
+  write_update_state true 45 "Backup created" ""
   info "Backup created at ${BACKUP_PATH}"
 }
 
@@ -1355,19 +1511,25 @@ update_container() {
   fi
 
   backup_data_dir
+  write_update_state true 50 "Preparing target image" ""
   resolve_target_image
 
   info "Stopping old container ${CONTAINER_NAME}"
+  write_update_state true 75 "Stopping old container" ""
   docker rm -f "${CONTAINER_NAME}" >/dev/null
 
   info "Starting new container from ${IMAGE}"
+  write_update_state true 85 "Starting updated container" ""
   docker run -d "${RESTORE_ARGS[@]}" "${IMAGE}" >/dev/null
 
+  write_update_state true 90 "Waiting for updated container to start" ""
   if ! wait_healthy "${HEALTH_TIMEOUT}"; then
+    write_update_state false 0 "Update failed; rolling back" "Updated container failed health check"
     rollback
     exit 1
   fi
 
+  write_update_state false 100 "Update completed" ""
   info "Updated ${CONTAINER_NAME} from ${OLD_IMAGE} to ${IMAGE}"
   [[ -n "${BACKUP_PATH:-}" ]] && info "Backup kept at ${BACKUP_PATH}"
   if [[ "$FOLLOW_LOGS" == "true" ]]; then
