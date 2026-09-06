@@ -20,6 +20,8 @@ CONTAINER_NAME="umbrel"
 DATA_DIR="${SCRIPT_DIR}/umbrel-data"
 DATA_DIR_SET="false"
 HOST_PORT="80"
+ADVERTISE_IP=""
+ADVERTISE_IP_SET="false"
 STOP_TIMEOUT="60"
 NO_CACHE="false"
 PULL="false"
@@ -145,6 +147,7 @@ Common options:
   --name <container>           Container name (default: umbrel)
   --data-dir <path>            Host directory mounted to /data
   --port <host-port>           Host port mapped to container 80 (default: 80)
+  --advertise-ip <ip>          LAN IP to include in the local HTTPS cert (default: auto-detected)
   --stop-timeout <sec>         Stop timeout in seconds (default: 60)
   --runtime-profile <profile>  Runtime profile: minimal|compat (default: minimal)
   --release-channel <channel>  Release channel: stable|beta (default: stable)
@@ -477,6 +480,7 @@ parse_options() {
       --name)           CONTAINER_NAME="${2:?missing value for --name}"; shift 2 ;;
       --data-dir)       DATA_DIR="${2:?missing value for --data-dir}"; DATA_DIR_SET="true"; shift 2 ;;
       --port)           HOST_PORT="${2:?missing value for --port}"; shift 2 ;;
+      --advertise-ip)   ADVERTISE_IP="${2:?missing value for --advertise-ip}"; ADVERTISE_IP_SET="true"; shift 2 ;;
       --stop-timeout)   STOP_TIMEOUT="${2:?missing value for --stop-timeout}"; shift 2 ;;
       --runtime-profile) RUNTIME_PROFILE="${2:?missing value for --runtime-profile}"; RUNTIME_PROFILE_SET="true"; shift 2 ;;
       --release-channel) RELEASE_CHANNEL="${2:?missing value for --release-channel}"; RELEASE_CHANNEL_SET="true"; shift 2 ;;
@@ -605,17 +609,98 @@ remove_existing_container_if_any() {
   fi
 }
 
+# The container only sees its own internal Docker network interfaces, so umbreld's
+# self-signed local-HTTPS certificate never includes the host's real LAN IP as a
+# SAN entry. That makes strict TLS clients (e.g. the mobile app) reject the
+# connection with a hostname mismatch. Detect the host's outbound-facing LAN IP
+# so we can hand it to umbreld (via UMBREL_DOCKER_ADVERTISE_IP) to include in the cert.
+detect_lan_ip() {
+  local ip=""
+  if command -v python3 >/dev/null 2>&1; then
+    ip="$(python3 -c '
+import socket
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+try:
+    s.connect(("8.8.8.8", 80))
+    print(s.getsockname()[0])
+except Exception:
+    pass
+finally:
+    s.close()
+' 2>/dev/null)"
+  fi
+  if [[ -z "$ip" ]] && command -v ip >/dev/null 2>&1; then
+    ip="$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if ($i=="src") {print $(i+1); exit}}')"
+  fi
+  if [[ -z "$ip" ]] && command -v route >/dev/null 2>&1 && command -v ifconfig >/dev/null 2>&1; then
+    local iface
+    iface="$(route -n get 1.1.1.1 2>/dev/null | awk '/interface:/{print $2}')"
+    [[ -n "$iface" ]] && ip="$(ifconfig "$iface" 2>/dev/null | awk '/inet /{print $2; exit}')"
+  fi
+  printf '%s' "$ip"
+}
+
+# Same problem as the LAN IP, but for Tailscale: when Tailscale runs on the host
+# itself (not just as an Umbrel app), Docker's 0.0.0.0 port publishing forwards
+# tailscale0 traffic through the same as LAN traffic, but the container never
+# sees that address as "its own" either. Detect it too so it lands in the cert.
+detect_tailscale_ip() {
+  local ip=""
+  if command -v ip >/dev/null 2>&1; then
+    ip="$(ip -4 -o addr show tailscale0 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -n1)"
+  fi
+  if [[ -z "$ip" ]] && command -v ifconfig >/dev/null 2>&1; then
+    ip="$(ifconfig tailscale0 2>/dev/null | awk '/inet /{print $2; exit}')"
+  fi
+  printf '%s' "$ip"
+}
+
+# Build the comma-separated list of extra IPs to put in the local-HTTPS cert's
+# SAN list: the LAN IP (detected, or --advertise-ip override) plus a detected
+# Tailscale IP, if present. Either may be empty.
+build_advertise_ips() {
+  local lan_ip="$1"
+  local tailscale_ip
+  tailscale_ip="$(detect_tailscale_ip)"
+  if [[ -n "$tailscale_ip" && "$tailscale_ip" != "$lan_ip" ]]; then
+    info "Detected Tailscale IP ${tailscale_ip} for local HTTPS cert"
+  else
+    tailscale_ip=""
+  fi
+  local -a ips=()
+  [[ -n "$lan_ip" ]] && ips+=("$lan_ip")
+  [[ -n "$tailscale_ip" ]] && ips+=("$tailscale_ip")
+  local IFS=,
+  printf '%s' "${ips[*]}"
+}
+
 run_new_container() {
   ensure_image_default
   validate_runtime_profile
   validate_release_channel
   require_docker_socket
   mkdir -p "${DATA_DIR}"
+
+  local advertise_ip="${ADVERTISE_IP}"
+  if [[ -z "$advertise_ip" ]]; then
+    advertise_ip="$(detect_lan_ip)"
+    [[ -n "$advertise_ip" ]] && info "Detected LAN IP ${advertise_ip} for local HTTPS cert (override with --advertise-ip)"
+  fi
+  advertise_ip="$(build_advertise_ips "$advertise_ip")"
+
   local -a run_args=(
     --name "${CONTAINER_NAME}"
     --pid=host
     --cap-add SYS_ADMIN
+    --cap-add NET_ADMIN
+    # Machines (VM) support: libvirt/qemu need to write to /proc/sys (bridge
+    # interface config) and /dev/net/tun (TAP networking), both masked/blocked by
+    # Docker's defaults. --device /dev/kvm is added below only when present on the
+    # host, for hardware-accelerated VMs instead of software (TCG) emulation.
+    --security-opt systempaths=unconfined
+    --device /dev/net/tun:/dev/net/tun
     -p "${HOST_PORT}:80"
+    -p "443:443"
     -p "139:139"
     -p "445:445"
     -p "3702:3702/tcp"
@@ -628,6 +713,8 @@ run_new_container() {
     -e "UMBREL_RELEASE_CHANNEL=${RELEASE_CHANNEL}"
     --stop-timeout "${STOP_TIMEOUT}"
   )
+  [[ -n "$advertise_ip" ]] && run_args+=(-e "UMBREL_DOCKER_ADVERTISE_IP=${advertise_ip}")
+  [[ -e /dev/kvm ]] && run_args+=(--device /dev/kvm:/dev/kvm)
   append_host_sensor_binds run_args
 
   info "Starting container ${CONTAINER_NAME} (${IMAGE})"
@@ -986,7 +1073,9 @@ backups_restore() {
 
   info "Extracting archive..."
   local tmp_dir
-  tmp_dir="$(mktemp -d)"
+  # Stage extraction next to the archive rather than the system default temp
+  # dir: on hosts with a small tmpfs-backed /tmp, a multi-GB archive won't fit.
+  tmp_dir="$(mktemp -d -p "$(dirname "${archive}")")"
   local _restore_cleanup_done="false"
   _restore_cleanup() {
     [[ "${_restore_cleanup_done}" == "true" ]] && return
@@ -1022,7 +1111,7 @@ backups_restore() {
 
 # ── config ────────────────────────────────────────────────────────────────────
 config_show() {
-  local valid_keys=(REF CONTAINER_NAME DATA_DIR HOST_PORT STOP_TIMEOUT
+  local valid_keys=(REF CONTAINER_NAME DATA_DIR HOST_PORT ADVERTISE_IP STOP_TIMEOUT
     RUNTIME_PROFILE RELEASE_CHANNEL HEALTH_TIMEOUT BACKUP_DIR
     BACKUP_ENABLED BACKUPS_KEEP)
 
@@ -1059,7 +1148,7 @@ config_set() {
     err "Usage: ./umbrelctl config set KEY VALUE"
     exit 1
   fi
-  local valid_keys=(REF CONTAINER_NAME DATA_DIR HOST_PORT STOP_TIMEOUT
+  local valid_keys=(REF CONTAINER_NAME DATA_DIR HOST_PORT ADVERTISE_IP STOP_TIMEOUT
     RUNTIME_PROFILE RELEASE_CHANNEL HEALTH_TIMEOUT BACKUP_DIR
     BACKUP_ENABLED BACKUPS_KEEP)
   local k valid="false"
@@ -1291,7 +1380,10 @@ backup_data_dir() {
   local source_kib snapshot_kib progress_pid rsync_rc tar_rc
   local -a rsync_excludes=()
   data_basename="$(basename "${DATA_DIR}")"
-  snapshot_root="$(mktemp -d)"
+  # Stage the rsync snapshot on the same volume as the backup destination rather
+  # than the system default temp dir: on some hosts (e.g. NAS boxes with a small
+  # tmpfs-backed /tmp) the data directory is far larger than /tmp has room for.
+  snapshot_root="$(mktemp -d -p "${BACKUP_DIR}")"
   snapshot_data="${snapshot_root}/${data_basename}"
   archive_file="${BACKUP_PATH}/umbrel-data.tar"
   rsync_log="${BACKUP_PATH}/backup-rsync.log"
@@ -1371,12 +1463,35 @@ build_docker_run_args_from_inspect() {
   [[ -n "$pid_mode" ]] && RESTORE_ARGS+=(--pid="${pid_mode}")
 
   local has_sys_admin="false"
+  local has_net_admin="false"
   mapfile -t cap_adds < <(jq -r '.[0].HostConfig.CapAdd[]?' "${inspect_file}")
   for cap in "${cap_adds[@]}"; do
     RESTORE_ARGS+=(--cap-add "${cap}")
     [[ "${cap}" == "SYS_ADMIN" ]] && has_sys_admin="true"
+    [[ "${cap}" == "NET_ADMIN" ]] && has_net_admin="true"
   done
   [[ "${has_sys_admin}" != "true" ]] && RESTORE_ARGS+=(--cap-add SYS_ADMIN)
+  [[ "${has_net_admin}" != "true" ]] && RESTORE_ARGS+=(--cap-add NET_ADMIN)
+
+  # Older containers predate Machines (VM) support; add its requirements on upgrade too.
+  local has_systempaths_unconfined="false"
+  mapfile -t security_opts < <(jq -r '.[0].HostConfig.SecurityOpt[]?' "${inspect_file}")
+  for opt in "${security_opts[@]}"; do
+    RESTORE_ARGS+=(--security-opt "${opt}")
+    [[ "${opt}" == "systempaths=unconfined" ]] && has_systempaths_unconfined="true"
+  done
+  [[ "${has_systempaths_unconfined}" != "true" ]] && RESTORE_ARGS+=(--security-opt systempaths=unconfined)
+
+  local has_tun_device="false"
+  local has_kvm_device="false"
+  mapfile -t device_paths < <(jq -r '.[0].HostConfig.Devices[]?.PathOnHost' "${inspect_file}")
+  for device in "${device_paths[@]}"; do
+    RESTORE_ARGS+=(--device "${device}:${device}")
+    [[ "${device}" == "/dev/net/tun" ]] && has_tun_device="true"
+    [[ "${device}" == "/dev/kvm" ]] && has_kvm_device="true"
+  done
+  [[ "${has_tun_device}" != "true" ]] && RESTORE_ARGS+=(--device /dev/net/tun:/dev/net/tun)
+  [[ "${has_kvm_device}" != "true" && -e /dev/kvm ]] && RESTORE_ARGS+=(--device /dev/kvm:/dev/kvm)
 
   mapfile -t binds < <(jq -r '.[0].HostConfig.Binds[]?' "${inspect_file}")
   for bind in "${binds[@]}"; do
@@ -1384,16 +1499,32 @@ build_docker_run_args_from_inspect() {
   done
 
   mapfile -t envs < <(jq -r '.[0].Config.Env[]?' "${inspect_file}")
+  local previous_advertise_ip=""
   for env in "${envs[@]}"; do
     case "$env" in
       PATH=*|HOSTNAME=*|HOME=*|TERM=*|container=*|SHLVL=*|PWD=*) continue ;;
+      # Recomputed below (fresh detection can pick up a Tailscale IP that wasn't
+      # there, or wasn't up, last time this container was created), not copied
+      # verbatim - a plain copy would freeze in whatever was detected once.
+      UMBREL_DOCKER_ADVERTISE_IP=*) previous_advertise_ip="${env#UMBREL_DOCKER_ADVERTISE_IP=}"; continue ;;
     esac
     RESTORE_ARGS+=(-e "${env}")
   done
   [[ "${RUNTIME_PROFILE_SET}" == "true" ]] && RESTORE_ARGS+=(-e "UMBREL_RUNTIME_PROFILE=${RUNTIME_PROFILE}")
   [[ "${RELEASE_CHANNEL_SET}" == "true" ]]  && RESTORE_ARGS+=(-e "UMBREL_RELEASE_CHANNEL=${RELEASE_CHANNEL}")
+  # Older containers predate the local-HTTPS-cert LAN/Tailscale IP fix; add it on
+  # upgrade too. Keep whichever LAN IP was already recorded (or an explicit
+  # --advertise-ip override) as the base, and refresh the Tailscale IP each time.
+  {
+    local restore_advertise_ip="${ADVERTISE_IP}"
+    [[ -z "$restore_advertise_ip" ]] && restore_advertise_ip="${previous_advertise_ip%%,*}"
+    [[ -z "$restore_advertise_ip" ]] && restore_advertise_ip="$(detect_lan_ip)"
+    restore_advertise_ip="$(build_advertise_ips "$restore_advertise_ip")"
+    [[ -n "$restore_advertise_ip" ]] && RESTORE_ARGS+=(-e "UMBREL_DOCKER_ADVERTISE_IP=${restore_advertise_ip}")
+  }
 
   mapfile -t ports < <(jq -r '.[0].HostConfig.PortBindings | to_entries[]? | .key + "|" + (.value[0].HostPort // "") + "|" + (.value[0].HostIp // "")' "${inspect_file}")
+  local has_https_port="false"
   for entry in "${ports[@]}"; do
     local container_proto host_port host_ip container_port
     container_proto="${entry%%|*}"
@@ -1401,12 +1532,16 @@ build_docker_run_args_from_inspect() {
     host_ip="$(printf "%s" "${entry}" | cut -d'|' -f3)"
     container_port="${container_proto%/*}"
     [[ -z "$host_port" ]] && continue
+    [[ "${container_proto}" == "443/tcp" ]] && has_https_port="true"
     if [[ -n "$host_ip" && "$host_ip" != "0.0.0.0" ]]; then
       RESTORE_ARGS+=(-p "${host_ip}:${host_port}:${container_port}")
     else
       RESTORE_ARGS+=(-p "${host_port}:${container_port}")
     fi
   done
+  # Older containers were created before HTTPS (443) was published; add it so the
+  # iOS app's HTTPS reachability check doesn't hang and misreport "update required".
+  [[ "${has_https_port}" != "true" ]] && RESTORE_ARGS+=(-p "443:443")
 
   local restart_name restart_max
   restart_name="$(jq -r '.[0].HostConfig.RestartPolicy.Name // empty' "${inspect_file}")"

@@ -76,15 +76,50 @@ chmod 700 "$mount/tor/data"
 chmod -R 700 "$mount/tor/data/*" &>/dev/null || true
 
 # Enable mDNS discovery used by umbreld's SMB network scan.
+# With --pid=host, `pgrep -x <name>` can match the *host's* own dbus-daemon/
+# avahi-daemon (visible via the shared PID namespace) on hosts that already run
+# them systemwide (e.g. a real Linux NAS) - wrongly skipping our own daemon and
+# leaving mDNS/D-Bus non-functional inside the container. Check our own pidfile
+# (a separate file per mount namespace) and its liveness instead of process name.
+is_own_pid_alive() {
+  local pidfile="$1"
+  [ -f "$pidfile" ] && kill -0 "$(cat "$pidfile" 2>/dev/null)" 2>/dev/null
+}
 mkdir -p /run/dbus
-if ! pgrep -x dbus-daemon >/dev/null 2>&1; then
+if ! is_own_pid_alive /run/dbus/pid; then
   rm -f /run/dbus/pid /run/dbus/system_bus_socket
   dbus-daemon --system --fork || warn "Failed to start dbus-daemon"
 fi
-if ! pgrep -x avahi-daemon >/dev/null 2>&1; then
+if ! is_own_pid_alive /run/avahi-daemon/pid; then
   rm -f /run/avahi-daemon/pid
   avahi-daemon -D || warn "Failed to start avahi-daemon"
 fi
+
+# Start libvirt for the Machines (VM) feature. Requires the container to run with
+# --security-opt systempaths=unconfined and --device /dev/net/tun (see umbrelctl).
+# Docker mounts /sys read-only by default; libvirt needs to write bridge port
+# attributes (e.g. isolated) when attaching a VM's vnet interface. We have
+# CAP_SYS_ADMIN, so just remount it ourselves rather than needing a new docker flag.
+mount -o remount,rw /sys || warn "Failed to remount /sys read-write"
+mkdir -p /run/libvirt /var/lib/libvirt/qemu /var/lib/libvirt/swtpm /var/log/libvirt/qemu
+if ! pgrep -x virtlogd >/dev/null 2>&1; then
+  virtlogd -d || warn "Failed to start virtlogd"
+fi
+if ! pgrep -x libvirtd >/dev/null 2>&1; then
+  libvirtd -d || warn "Failed to start libvirtd"
+fi
+
+# umbreld's Machines firewall reconciliation expects a real dockerd's DOCKER-USER
+# chain and libvirt's native nftables firewall backend's guest_input/guest_cross
+# chains. Neither exists here: this container has no dockerd of its own (apps run
+# on the host daemon over the socket), and Debian's libvirt (9.0) predates the
+# native nftables backend. Scaffold equivalent chains, hooked into forward, so
+# umbreld's rule inserts land somewhere that actually filters traffic.
+nft add table ip filter 2>/dev/null || true
+nft add chain ip filter DOCKER-USER '{ type filter hook forward priority -190 ; policy accept ; }' 2>/dev/null || true
+nft add table ip libvirt_network 2>/dev/null || true
+nft add chain ip libvirt_network guest_input '{ type filter hook forward priority filter - 5 ; policy accept ; }' 2>/dev/null || true
+nft add chain ip libvirt_network guest_cross '{ type filter hook forward priority filter - 6 ; policy accept ; }' 2>/dev/null || true
 
 # Build deterministic IPv4 host mappings for SMB mDNS targets so smbclient
 # does not pick unusable link-local addresses.
@@ -97,8 +132,12 @@ if command -v avahi-browse >/dev/null 2>&1; then
     [[ "$mdnsHost" == *.local ]] || continue
 
     escapedHost="${mdnsHost//./\\.}"
-    sed -i "/[[:space:]]${escapedHost}\$/d" /etc/hosts
-    printf '%s %s\n' "$address" "$mdnsHost" >> /etc/hosts
+    # /etc/hosts can be a bind-mounted file on some Docker hosts; sed -i's
+    # rename-over-original approach fails there with "Device or resource busy".
+    # Skip re-adding hosts we've already recorded instead of rewriting in place.
+    if ! grep -qE "[[:space:]]${escapedHost}\$" /etc/hosts 2>/dev/null; then
+      printf '%s %s\n' "$address" "$mdnsHost" >> /etc/hosts || true
+    fi
   done < <(timeout 5 avahi-browse --resolve --terminate _smb._tcp --parsable 2>/dev/null || true)
 fi
 

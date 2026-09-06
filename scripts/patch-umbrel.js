@@ -31,16 +31,31 @@ function insertAfterImportBlock(text, insert) {
   if (text.includes(insert.trim())) return text;
   const lines = text.split('\n');
   let lastImport = -1;
+  let inImport = false;
+  let depth = 0;
   for (let i = 0; i < lines.length; i += 1) {
     const line = lines[i];
-    if (/^\s*import\b/.test(line)) {
+    if (!inImport) {
+      if (/^\s*import\b/.test(line)) {
+        inImport = true;
+      } else if (/^\s*$/.test(line) && lastImport !== -1) {
+        continue;
+      } else {
+        break;
+      }
+    }
+    // Track brace/paren/bracket depth so a multi-line import (e.g.
+    // `import App, {\n\tfoo,\n} from './app.js'`) isn't mistaken for the
+    // end of the import block partway through its specifier list.
+    for (const char of line) {
+      if (char === '{' || char === '(' || char === '[') depth += 1;
+      else if (char === '}' || char === ')' || char === ']') depth -= 1;
+    }
+    if (depth <= 0) {
+      inImport = false;
+      depth = 0;
       lastImport = i;
-      continue;
     }
-    if (/^\s*$/.test(line) && lastImport !== -1) {
-      continue;
-    }
-    break;
   }
   if (lastImport === -1) return `${insert}\n${text}`;
   lines.splice(lastImport + 1, 0, '', insert.trim(), '');
@@ -206,6 +221,38 @@ function patchLegacyAppScript() {
           '  fi\n',
       );
     }
+
+    // UMBREL_ROOT (the data directory) can legitimately contain spaces on Docker
+    // hosts (e.g. macOS paths like "/Users/foo/UmbrelOS Dev Tool/..."). These two
+    // loops assign a glob pattern to a plain string then expand it unquoted, so
+    // bash word-splits on the space and every app install/update fails with
+    // "cp: cannot stat '.../UmbrelOS': No such file or directory". Use arrays instead.
+    if (!text.includes('APP_TEMPLATE_FILES=("${app_data_dir}"/*.template)')) {
+      text = text.replace(
+        '  APP_TEMPLATE_FILES="${app_data_dir}/*.template"\n' +
+          '  \n' +
+          '  shopt -s nullglob\n' +
+          '  for APP_TEMPLATE_INPUT_FILE in $APP_TEMPLATE_FILES; do\n',
+        '  shopt -s nullglob\n' +
+          '  APP_TEMPLATE_FILES=("${app_data_dir}"/*.template)\n' +
+          '  for APP_TEMPLATE_INPUT_FILE in "${APP_TEMPLATE_FILES[@]}"; do\n',
+      );
+    }
+
+    if (!text.includes('APP_FILES=("${app_repo_dir}"/${filename})')) {
+      text = text.replace(
+        '  for filename in $files_to_copy; do\n' +
+          '    APP_FILES="${app_repo_dir}/${filename}"\n' +
+          '\n' +
+          '    for app_file in $APP_FILES; do\n',
+        '  shopt -s nullglob\n' +
+          '  for filename in $files_to_copy; do\n' +
+          '    APP_FILES=("${app_repo_dir}"/${filename})\n' +
+          '\n' +
+          '    for app_file in "${APP_FILES[@]}"; do\n',
+      );
+    }
+
     return text;
   });
 }
@@ -586,15 +633,28 @@ function patchDbusAndFilesServices() {
 
     if (!text.includes('smbcontrol all shutdown')) {
       text = text.replace(
-        "\tasync stop() {\n\t\tthis.logger.log('Stopping samba')\n\t\tthis.#removeFileChangeListener?.()\n\t\tawait $`systemctl stop smbd`.catch((error) => this.logger.error(`Failed to stop samba`, error))\n\t\tawait $`systemctl stop wsdd2`.catch((error) => this.logger.error(`Failed to stop wsdd2`, error))\n\t}\n",
-        "\tasync stop() {\n\t\tthis.logger.log('Stopping samba')\n\t\tthis.#removeFileChangeListener?.()\n\n\t\tif (UMBREL_DOCKER_MODE) {\n\t\t\tawait $`smbcontrol all shutdown`.catch(async (error) => {\n\t\t\t\tthis.logger.error(`Failed to stop samba via smbcontrol`, error)\n\t\t\t\tawait $`pkill -x smbd`.catch((killError) => this.logger.error(`Failed to stop samba`, killError))\n\t\t\t})\n\t\t\tawait $`pkill -x wsdd2`.catch(() => {})\n\t\t\treturn\n\t\t}\n\n\t\tawait $`systemctl stop smbd`.catch((error) => this.logger.error(`Failed to stop samba`, error))\n\t\tawait $`systemctl stop wsdd2`.catch((error) => this.logger.error(`Failed to stop wsdd2`, error))\n\t}\n",
+        "\tasync stop() {\n\t\tthis.logger.log('Stopping samba')\n\t\tthis.#removeFileChangeListener?.()\n\t\tthis.#removeExternalStorageChangeListener?.()\n\t\tawait $`systemctl stop smbd`.catch((error) => this.logger.error('Failed to stop samba', error))\n\t\tawait $`systemctl stop wsdd2`.catch((error) => this.logger.error('Failed to stop wsdd2', error))\n\t}\n",
+        // Replacement is a function so JS never interprets the `$`...`` execa syntax
+        // below as a $-prefixed String.replace substitution pattern (e.g. $` means
+        // "text before the match" and would otherwise duplicate the whole file).
+        () =>
+          "\tasync stop() {\n\t\tthis.logger.log('Stopping samba')\n\t\tthis.#removeFileChangeListener?.()\n\t\tthis.#removeExternalStorageChangeListener?.()\n\n\t\tif (UMBREL_DOCKER_MODE) {\n\t\t\tawait $`smbcontrol all shutdown`.catch(async (error) => {\n\t\t\t\tthis.logger.error('Failed to stop samba via smbcontrol', error)\n\t\t\t\tawait $`pkill -x smbd`.catch((killError) => this.logger.error('Failed to stop samba', killError))\n\t\t\t})\n\t\t\tawait $`pkill -x wsdd2`.catch(() => {})\n\t\t\treturn\n\t\t}\n\n\t\tawait $`systemctl stop smbd`.catch((error) => this.logger.error('Failed to stop samba', error))\n\t\tawait $`systemctl stop wsdd2`.catch((error) => this.logger.error('Failed to stop wsdd2', error))\n\t}\n",
       );
     }
 
     if (!text.includes('smbd -D --configfile=/etc/samba/smb.conf')) {
       text = text.replace(
-        "\t\t// Write out Samba config\n\t\tawait fse.writeFile('/etc/samba/smb.conf', config)\n\n\t\t// If we don't have any shares, ensure samba isn't running and return\n\t\tif (shares.length === 0) return await $`systemctl stop smbd`\n\n\t\t// Otherwise start samba, or reload it's config if it's already running\n\t\tawait $`systemctl start smbd`\n\t\tawait $`smbcontrol smbd reload-config`\n\n\t\t// We also start wsdd2 for better Windows discovery.\n\t\t// We need to manually start this along with samba because if we boot with wsdd2\n\t\t// enabled but without samba it will shutdown when it sees samba isn't running.\n\t\t// It won't then auto start if a share is added later.\n\t\tawait $`systemctl start wsdd2`\n",
-        "\t\t// Write out Samba config\n\t\tawait fse.ensureDir('/var/log/samba')\n\t\tawait fse.ensureDir('/run/samba')\n\t\tawait fse.writeFile('/etc/samba/smb.conf', config)\n\n\t\tif (UMBREL_DOCKER_MODE) {\n\t\t\t// If we don't have any shares, ensure samba isn't running and return.\n\t\t\tif (shares.length === 0) {\n\t\t\t\tawait $`smbcontrol all shutdown`.catch(async () => {\n\t\t\t\t\tawait $`pkill -x smbd`.catch(() => {})\n\t\t\t\t})\n\t\t\t\tawait $`pkill -x wsdd2`.catch(() => {})\n\t\t\t\treturn\n\t\t\t}\n\n\t\t\t// Otherwise start samba if needed and reload its config.\n\t\t\tconst smbdRunning = await $`pgrep -x smbd`.then(() => true).catch(() => false)\n\t\t\tif (!smbdRunning) await $`smbd -D --configfile=/etc/samba/smb.conf`\n\t\t\tawait $`smbcontrol smbd reload-config`\n\n\t\t\t// Start wsdd2 in daemon mode for Windows discovery if it is not already running.\n\t\t\tconst wsdd2Running = await $`pgrep -x wsdd2`.then(() => true).catch(() => false)\n\t\t\tif (!wsdd2Running) {\n\t\t\t\tawait $`wsdd2 -d`.catch((error) => this.logger.error(`Failed to start wsdd2`, error))\n\t\t\t}\n\t\t\treturn\n\t\t}\n\n\t\t// If we don't have any shares, ensure samba isn't running and return\n\t\tif (shares.length === 0) return await $`systemctl stop smbd`\n\n\t\t// Otherwise start samba, or reload it's config if it's already running\n\t\tawait $`systemctl start smbd`\n\t\tawait $`smbcontrol smbd reload-config`\n\n\t\t// We also start wsdd2 for better Windows discovery.\n\t\t// We need to manually start this along with samba because if we boot with wsdd2\n\t\t// enabled but without samba it will shutdown when it sees samba isn't running.\n\t\t// It won't then auto start if a share is added later.\n\t\tawait $`systemctl start wsdd2`\n",
+        "\t\tawait this.#closeResolvedShares(sharesToClose)\n\t\tawait fse.writeFile('/etc/samba/smb.conf', config)\n\n\t\tif (activeShares === 0) return await $`systemctl stop smbd`\n\n\t\tawait $`systemctl start smbd`\n\t\tawait $`smbcontrol smbd reload-config`\n\t\tawait $`systemctl start wsdd2`\n",
+        () =>
+          "\t\tawait this.#closeResolvedShares(sharesToClose)\n\t\tawait fse.writeFile('/etc/samba/smb.conf', config)\n\n\t\tif (UMBREL_DOCKER_MODE) {\n\t\t\tif (activeShares === 0) {\n\t\t\t\tawait $`smbcontrol all shutdown`.catch(async () => {\n\t\t\t\t\tawait $`pkill -x smbd`.catch(() => {})\n\t\t\t\t})\n\t\t\t\tawait $`pkill -x wsdd2`.catch(() => {})\n\t\t\t\treturn\n\t\t\t}\n\n\t\t\tconst smbdRunning = await $`pgrep -x smbd`.then(() => true).catch(() => false)\n\t\t\tif (!smbdRunning) await $`smbd -D --configfile=/etc/samba/smb.conf`\n\t\t\tawait $`smbcontrol smbd reload-config`\n\n\t\t\tconst wsdd2Running = await $`pgrep -x wsdd2`.then(() => true).catch(() => false)\n\t\t\tif (!wsdd2Running) await $`wsdd2 -d`.catch((error) => this.logger.error('Failed to start wsdd2', error))\n\t\t\treturn\n\t\t}\n\n\t\tif (activeShares === 0) return await $`systemctl stop smbd`\n\n\t\tawait $`systemctl start smbd`\n\t\tawait $`smbcontrol smbd reload-config`\n\t\tawait $`systemctl start wsdd2`\n",
+      );
+    }
+
+    if (!text.includes("await $`smbd -D --configfile=/etc/samba/smb.conf`\n\t\t\t} else {")) {
+      text = text.replace(
+        "\tasync #restartSambaForRevocation(cause: unknown) {\n\t\tthis.logger.error('Failed to target a Samba session; restarting smbd to guarantee revocation', cause)\n\t\ttry {\n\t\t\tawait $`systemctl restart smbd`\n\t\t} catch (restartError) {\n\t\t\tthrow new AggregateError([cause, restartError], 'Failed to revoke active Samba sessions')\n\t\t}\n\t}\n",
+        () =>
+          "\tasync #restartSambaForRevocation(cause: unknown) {\n\t\tthis.logger.error('Failed to target a Samba session; restarting smbd to guarantee revocation', cause)\n\t\ttry {\n\t\t\tif (UMBREL_DOCKER_MODE) {\n\t\t\t\tawait $`smbcontrol all shutdown`.catch(() => $`pkill -x smbd`.catch(() => {}))\n\t\t\t\tawait $`smbd -D --configfile=/etc/samba/smb.conf`\n\t\t\t} else {\n\t\t\t\tawait $`systemctl restart smbd`\n\t\t\t}\n\t\t} catch (restartError) {\n\t\t\tthrow new AggregateError([cause, restartError], 'Failed to revoke active Samba sessions')\n\t\t}\n\t}\n",
       );
     }
 
@@ -689,15 +749,208 @@ function patchSystemModules() {
         "export async function connectToWiFiNetwork({ssid, password}: {ssid: string; password?: string}) {\n\tif (UMBREL_DOCKER_MODE) throw new Error('WiFi not supported in docker mode')",
       );
 
+      // getIpAddresses() reads the container's own network interfaces. That's fine for
+      // the LAN-ingress cert (patched separately in lan-ingress.ts), but this function
+      // also backs the authenticated system.getIpAddresses tRPC route, which is the
+      // ONLY source the iOS/macOS apps trust for a device's Tailscale address (Bonjour-
+      // discovered Tailscale-range IPs are deliberately ignored client-side as unauthenticated).
+      // Since Tailscale runs on the Docker host, not in this container's network
+      // namespace, os.networkInterfaces() never reports it here, so Photo Backup gets
+      // permanently stuck on "Waiting for Tailscale". Fold in the same host/Tailscale
+      // IPs umbrelctl already advertises for the cert SAN.
+      if (!text.includes('UMBREL_DOCKER_ADVERTISE_IP')) {
+        text = text.replace(
+          "\treturn (\n\t\tObject.entries(os.networkInterfaces())\n\t\t\t// Omit interfaces with excluded names\n\t\t\t.filter(([name]) => !excludeInterfaceNames.some((expression) => expression.test(name)))\n\t\t\t// Flatten interface map to an array of addresses\n\t\t\t.flatMap(([name, addresses = []]) => addresses.map((address) => ({name, ...address})))\n\t\t\t// Select valid non-loopback IPv4 addresses\n\t\t\t.filter((entry) => entry.family === 'IPv4' && !entry.internal && isIPv4(entry.address))\n\t\t\t// Omit addresses within excluded ranges\n\t\t\t.filter((entry) => !excludeAddressRanges.some((expression) => expression.test(entry.address)))\n\t\t\t// Return remaining addresses\n\t\t\t.map((entry) => entry.address)\n\t)\n}",
+          () =>
+            "\tconst detectedAddresses = Object.entries(os.networkInterfaces())\n\t\t// Omit interfaces with excluded names\n\t\t.filter(([name]) => !excludeInterfaceNames.some((expression) => expression.test(name)))\n\t\t// Flatten interface map to an array of addresses\n\t\t.flatMap(([name, addresses = []]) => addresses.map((address) => ({name, ...address})))\n\t\t// Select valid non-loopback IPv4 addresses\n\t\t.filter((entry) => entry.family === 'IPv4' && !entry.internal && isIPv4(entry.address))\n\t\t// Omit addresses within excluded ranges\n\t\t.filter((entry) => !excludeAddressRanges.some((expression) => expression.test(entry.address)))\n\t\t// Return remaining addresses\n\t\t.map((entry) => entry.address)\n\tconst advertisedAddresses = (process.env.UMBREL_DOCKER_ADVERTISE_IP ?? '')\n\t\t.split(',')\n\t\t.map((address) => address.trim())\n\t\t.filter((address) => isIPv4(address))\n\treturn [...new Set([...detectedAddresses, ...advertisedAddresses])]\n}",
+        );
+      }
+
       return text;
     });
   }
+}
+
+function patchThunderbolt() {
+  // udevadm isn't installed in the container image and there's no real
+  // Thunderbolt hardware to monitor, so the udev monitor process fails to
+  // spawn and gets endlessly restarted every 5s. Skip it entirely in docker mode.
+  patchFile('packages/umbreld/source/modules/hardware/thunderbolt.ts', (text) => {
+    if (!text.includes("const UMBREL_DOCKER_MODE = process.env.UMBREL_DOCKER_MODE === 'true'")) {
+      text = insertAfterImportBlock(text, "const UMBREL_DOCKER_MODE = process.env.UMBREL_DOCKER_MODE === 'true'")
+    }
+
+    if (!text.includes('Skipping Thunderbolt authorization monitor in docker mode')) {
+      text = text.replace(
+        '\tasync start() {\n\t\tif (this.#monitorAbortController) return\n',
+        "\tasync start() {\n\t\tif (UMBREL_DOCKER_MODE) {\n\t\t\tthis.logger.log('Skipping Thunderbolt authorization monitor in docker mode')\n\t\t\treturn\n\t\t}\n\n\t\tif (this.#monitorAbortController) return\n",
+      );
+    }
+
+    return text;
+  });
+}
+
+function patchDurableFilesystem() {
+  // Docker Desktop's bind-mount filesystem sharing (VirtioFS/gRPC-FUSE on macOS/Windows)
+  // doesn't support fsync on directory file descriptors, so every durable write (including
+  // the one auth.ts does on login) throws EBADF here even though the file itself was
+  // already written and renamed successfully. Tolerate it in docker mode.
+  patchFile('packages/umbreld/source/modules/utilities/durable-filesystem.ts', (text) => {
+    if (!text.includes("const UMBREL_DOCKER_MODE = process.env.UMBREL_DOCKER_MODE === 'true'")) {
+      text = insertAfterImportBlock(text, "const UMBREL_DOCKER_MODE = process.env.UMBREL_DOCKER_MODE === 'true'")
+    }
+
+    if (!text.includes("Some Docker bind-mount filesystems")) {
+      text = text.replace(
+        "export async function syncDirectory(path: string) {\n\tconst handle = await fs.open(path, 'r')\n\ttry {\n\t\tawait handle.sync()\n\t} finally {\n\t\tawait handle.close()\n\t}\n}\n",
+        "export async function syncDirectory(path: string) {\n\tconst handle = await fs.open(path, 'r')\n\ttry {\n\t\tawait handle.sync()\n\t} catch (error) {\n\t\t// Some Docker bind-mount filesystems (e.g. Docker Desktop's VirtioFS/gRPC-FUSE\n\t\t// sharing on macOS/Windows) don't support fsync on directory file descriptors.\n\t\t// The file's own contents are already fsynced before this step, so tolerate a\n\t\t// failed directory fsync here rather than failing durable writes like login.\n\t\tif (!UMBREL_DOCKER_MODE) throw error\n\t} finally {\n\t\tawait handle.close()\n\t}\n}\n",
+      );
+    }
+
+    return text;
+  });
+}
+
+function patchLanIngressAdvertiseIp() {
+  // The local-HTTPS server cert's SAN list is built from the container's own
+  // network interfaces, which are Docker-internal (e.g. 172.17.x.x). Clients
+  // connecting via the host's real LAN IP, or a Tailscale IP when Tailscale runs
+  // on the host itself (both only work via Docker's 0.0.0.0 port publishing, and
+  // neither is visible to the container as "its own" address) then fail strict
+  // TLS hostname verification. umbrelctl detects these and passes them in via
+  // this env var (comma-separated); include them all in the cert's SAN list.
+  patchFile('packages/umbreld/source/modules/lan-ingress/lan-ingress.ts', (text) => {
+    if (text.includes('UMBREL_DOCKER_ADVERTISE_IP')) return text;
+    return text.replace(
+      "\t\tconst ips = new Set(['127.0.0.1', ...getIpAddresses()])\n",
+      "\t\tconst ips = new Set(['127.0.0.1', ...getIpAddresses()])\n\t\tfor (const advertiseIp of (process.env.UMBREL_DOCKER_ADVERTISE_IP ?? '').split(',')) {\n\t\t\tif (advertiseIp) ips.add(advertiseIp)\n\t\t}\n",
+    );
+  });
+}
+
+function patchLanIngressFib() {
+  // `fib daddr type local` needs the nft_fib_inet kernel module. Some Docker hosts
+  // (e.g. Docker Desktop's LinuxKit VM) don't have it loaded, and a container can't
+  // load kernel modules itself, so every LAN ingress refresh throws and crashes the
+  // whole boot. Match this container's own addresses explicitly instead - equivalent
+  // here since ingress only needs to recognize traffic addressed to itself.
+  patchFile('packages/umbreld/source/modules/lan-ingress/lan-ingress.ts', (text) => {
+    if (text.includes('local_addresses')) return text;
+    return text.replace(
+      '\t// Generate public-port redirects plus hidden-port guard rules.\n' +
+        '\tprivate buildNftRuleset(redirectRoutes: IngressPortMapping[], hiddenPortRoutes: IngressPortMapping[]) {\n' +
+        '\t\tconst redirectRules = redirectRoutes.map(\n' +
+        '\t\t\t(route) =>\n' +
+        '\t\t\t\t`add rule inet ${NFT_TABLE_NAME} prerouting fib daddr type local iifname != "lo" tcp dport ${route.publicPort} redirect to :${route.hiddenPort}`,\n' +
+        '\t\t)\n' +
+        '\t\tconst hiddenPortDropRules = hiddenPortRoutes.map(\n' +
+        '\t\t\t(route) =>\n' +
+        '\t\t\t\t`add rule inet ${NFT_TABLE_NAME} input iifname != "lo" tcp dport ${route.hiddenPort} ct original proto-dst != ${route.publicPort} drop`,\n' +
+        '\t\t)\n' +
+        '\t\t// Use nft\'s named priority offsets to make the ordering explicit: app-port\n' +
+        '\t\t// redirects run just before Docker\'s dstnat port-publishing rules, and\n' +
+        '\t\t// hidden-port drops run just before the standard filter priority.\n' +
+        '\t\treturn [\n' +
+        '\t\t\t`add table inet ${NFT_TABLE_NAME}`,\n' +
+        '\t\t\t`flush table inet ${NFT_TABLE_NAME}`,\n' +
+        '\t\t\t`add chain inet ${NFT_TABLE_NAME} prerouting { type nat hook prerouting priority dstnat - 1; policy accept; }`,\n' +
+        '\t\t\t`add chain inet ${NFT_TABLE_NAME} input { type filter hook input priority filter - 1; policy accept; }`,\n' +
+        '\t\t\t...redirectRules,\n' +
+        '\t\t\t...hiddenPortDropRules,\n' +
+        "\t\t\t'',\n" +
+        "\t\t].join('\\n')\n" +
+        '\t}\n',
+      () =>
+        '\t// Generate public-port redirects plus hidden-port guard rules.\n' +
+        '\tprivate buildNftRuleset(redirectRoutes: IngressPortMapping[], hiddenPortRoutes: IngressPortMapping[]) {\n' +
+        "\t\tconst localAddresses = [...new Set(['127.0.0.1', ...getIpAddresses()])]\n" +
+        '\t\tconst redirectRules = redirectRoutes.map(\n' +
+        '\t\t\t(route) =>\n' +
+        '\t\t\t\t`add rule inet ${NFT_TABLE_NAME} prerouting ip daddr @local_addresses iifname != "lo" tcp dport ${route.publicPort} redirect to :${route.hiddenPort}`,\n' +
+        '\t\t)\n' +
+        '\t\tconst hiddenPortDropRules = hiddenPortRoutes.map(\n' +
+        '\t\t\t(route) =>\n' +
+        '\t\t\t\t`add rule inet ${NFT_TABLE_NAME} input iifname != "lo" tcp dport ${route.hiddenPort} ct original proto-dst != ${route.publicPort} drop`,\n' +
+        '\t\t)\n' +
+        '\t\t// Use nft\'s named priority offsets to make the ordering explicit: app-port\n' +
+        '\t\t// redirects run just before Docker\'s dstnat port-publishing rules, and\n' +
+        '\t\t// hidden-port drops run just before the standard filter priority.\n' +
+        '\t\treturn [\n' +
+        '\t\t\t`add table inet ${NFT_TABLE_NAME}`,\n' +
+        '\t\t\t`flush table inet ${NFT_TABLE_NAME}`,\n' +
+        '\t\t\t`add set inet ${NFT_TABLE_NAME} local_addresses { type ipv4_addr; elements = { ${localAddresses.join(\', \')} } }`,\n' +
+        '\t\t\t`add chain inet ${NFT_TABLE_NAME} prerouting { type nat hook prerouting priority dstnat - 1; policy accept; }`,\n' +
+        '\t\t\t`add chain inet ${NFT_TABLE_NAME} input { type filter hook input priority filter - 1; policy accept; }`,\n' +
+        '\t\t\t...redirectRules,\n' +
+        '\t\t\t...hiddenPortDropRules,\n' +
+        "\t\t\t'',\n" +
+        "\t\t].join('\\n')\n" +
+        '\t}\n',
+    );
+  });
+}
+
+function patchMachineType() {
+  // Real Umbrel hardware ships a much newer QEMU than Debian bookworm's 7.2, so
+  // umbreld hardcodes machine types (virt-9.2, pc-q35-9.2, pc-i440fx-9.2) that
+  // don't exist here - every VM start fails with "does not support machine type".
+  // Pin to versions our installed QEMU actually supports.
+  patchFile('packages/umbreld/source/modules/machines/domain.ts', (text) => {
+    return text.replace(
+      "export function defaultMachineType(profile: PlatformProfile) {\n\tswitch (profile) {\n\t\tcase 'modern-x86':\n\t\tcase 'windows-7-x86':\n\t\t\treturn 'pc-q35-9.2'\n\t\tcase 'legacy-x86':\n\t\tcase 'windows-98-x86':\n\t\t\treturn 'pc-i440fx-9.2'\n\t\tcase 'modern-arm64':\n\t\t\treturn 'virt-9.2'\n\t}\n}\n",
+      "export function defaultMachineType(profile: PlatformProfile) {\n\tswitch (profile) {\n\t\tcase 'modern-x86':\n\t\tcase 'windows-7-x86':\n\t\t\treturn 'pc-q35-7.2'\n\t\tcase 'legacy-x86':\n\t\tcase 'windows-98-x86':\n\t\t\treturn 'pc-i440fx-7.2'\n\t\tcase 'modern-arm64':\n\t\t\treturn 'virt-7.2'\n\t}\n}\n",
+    );
+  });
+
+  // The domain XML hardcodes an AppArmor seclabel, which overrides our qemu.conf
+  // `security_driver = "none"` default. AppArmor isn't available inside the
+  // container (no LSM/securityfs), so every VM start fails outright. Drop it and
+  // let libvirt fall back to the configured default.
+  patchFile('packages/umbreld/source/modules/machines/domain.ts', (text) => {
+    return text.replace(
+      "  <on_crash>restart</on_crash>\n  <seclabel type='dynamic' model='apparmor' relabel='yes'/>\n  <devices>\n",
+      '  <on_crash>restart</on_crash>\n  <devices>\n',
+    );
+  });
+}
+
+function patchMdnsAdvertisement() {
+  // Advertisement.update() publishes the _umbrel._tcp mDNS service using Avahi's
+  // default `%h` per-interface addressing, which inside a container only resolves
+  // to internal-only addresses (e.g. 172.17.x.x) - never the real LAN/Tailscale IP.
+  // This breaks the app's "scan for nearby Umbrels" first-pairing flow. Publish a
+  // static host alias via Avahi's static-hosts mechanism pointing at the same
+  // host/Tailscale IPs umbrelctl already advertises for the cert SAN, and point the
+  // service's SRV record at that alias instead of the default %h.
+  patchFile('packages/umbreld/source/modules/system-ng/advertisement.ts', (text) => {
+    if (text.includes('UMBREL_DOCKER_ADVERTISE_IP')) return text;
+    return text.replace(
+      "\tasync update() {\n\t\tconst id = await this.#umbreld.systemNg.device.getDiscoveryId()\n\n\t\tconst serviceFile = `<?xml version=\"1.0\" standalone='no'?>\n<!DOCTYPE service-group SYSTEM \"avahi-service.dtd\">\n<service-group>\n\t<name replace-wildcards=\"yes\">%h</name>\n\t<service>\n\t\t<type>_umbrel._tcp</type>\n\t\t<port>${publicHttpPort}</port>\n\t\t<txt-record>id=${escapeXml(id)}</txt-record>\n\t</service>\n</service-group>\n`\n\t\tawait fse.writeFile(serviceFilePath, serviceFile)\n\t\tthis.logger.log('Wrote mDNS service file')\n\t}\n",
+      () =>
+        "\tasync update() {\n\t\tconst id = await this.#umbreld.systemNg.device.getDiscoveryId()\n\n\t\tconst advertiseIps = (process.env.UMBREL_DOCKER_ADVERTISE_IP ?? '')\n\t\t\t.split(',')\n\t\t\t.map((ip) => ip.trim())\n\t\t\t.filter(Boolean)\n\t\tconst dockerHostAlias = 'umbrel-docker-host.local'\n\t\tconst useDockerHostAlias = advertiseIps.length > 0\n\n\t\tif (useDockerHostAlias) {\n\t\t\tconst hostsFile = advertiseIps.map((ip) => `${ip}\\t${dockerHostAlias}`).join('\\n') + '\\n'\n\t\t\tawait fse.writeFile('/etc/avahi/hosts', hostsFile)\n\t\t}\n\n\t\tconst hostNameLine = useDockerHostAlias ? `\\t\\t<host-name>${dockerHostAlias}</host-name>\\n` : ''\n\t\tconst serviceFile = `<?xml version=\"1.0\" standalone='no'?>\n<!DOCTYPE service-group SYSTEM \"avahi-service.dtd\">\n<service-group>\n\t<name replace-wildcards=\"yes\">%h</name>\n\t<service>\n\t\t<type>_umbrel._tcp</type>\n${hostNameLine}\t\t<port>${publicHttpPort}</port>\n\t\t<txt-record>id=${escapeXml(id)}</txt-record>\n\t</service>\n</service-group>\n`\n\t\tawait fse.writeFile(serviceFilePath, serviceFile)\n\t\tif (useDockerHostAlias) {\n\t\t\tawait execFile('avahi-daemon', ['--reload']).catch(() => {})\n\t\t}\n\t\tthis.logger.log('Wrote mDNS service file')\n\t}\n",
+    );
+  });
+
+  patchFile('packages/umbreld/source/modules/system-ng/advertisement.ts', (text) => {
+    if (text.includes('const execFile = promisify')) return text;
+    return insertAfterImportBlock(
+      text,
+      "import {execFile as execFileCallback} from 'node:child_process'\nimport {promisify} from 'node:util'\n\nconst execFile = promisify(execFileCallback)",
+    );
+  });
 }
 
 function run() {
   patchComposeNetwork();
   patchCommitPartition();
   patchFilesPathValidation();
+  patchThunderbolt();
+  patchLanIngressAdvertiseIp();
+  patchLanIngressFib();
+  patchMdnsAdvertisement();
+  patchMachineType();
+  patchDurableFilesystem();
   patchDbusAndFilesServices();
   patchNetworkStorage();
   patchIsUmbrelHome();
