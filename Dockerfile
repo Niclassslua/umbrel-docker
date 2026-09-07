@@ -107,7 +107,10 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
        && apt-get update -y \
        && apt-get --no-install-recommends -y -t bookworm-backports install libheif1 libheif-plugin-libde265; \
      fi \
-  && apt-get --no-install-recommends -y install qemu-system-x86 qemu-system-arm qemu-utils libvirt-daemon-system libvirt-clients dnsmasq-base swtpm swtpm-tools cloud-image-utils ovmf qemu-efi-aarch64 \
+  # Machines (VM) support: QEMU/libvirt runtime, firmware, TPM, cloud-init,
+  # and media-authoring tools (mtools, libarchive-tools, dosfstools, wimtools,
+  # xorriso) needed by umbreld to stage and patch Windows, DOS, and Linux images.
+  && apt-get --no-install-recommends -y install qemu-system-x86 qemu-system-arm qemu-utils libvirt-daemon-system libvirt-clients dnsmasq-base swtpm swtpm-tools cloud-image-utils ovmf qemu-efi-aarch64 mtools libarchive-tools dosfstools wimtools xorriso \
   && curl -fsSL https://download.docker.com/linux/debian/gpg | gpg --dearmor -o /usr/share/keyrings/docker.gpg \
   && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker.gpg] https://download.docker.com/linux/debian bookworm stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null \
   && apt-get update -y \

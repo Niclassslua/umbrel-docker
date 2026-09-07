@@ -121,6 +121,10 @@ nft add table ip libvirt_network 2>/dev/null || true
 nft add chain ip libvirt_network guest_input '{ type filter hook forward priority filter - 5 ; policy accept ; }' 2>/dev/null || true
 nft add chain ip libvirt_network guest_cross '{ type filter hook forward priority filter - 6 ; policy accept ; }' 2>/dev/null || true
 
+# Give non-root libvirt-qemu access to KVM hardware acceleration and TAP devices
+[ -e /dev/kvm ] && chmod 666 /dev/kvm || true
+[ -e /dev/net/tun ] && chmod 666 /dev/net/tun || true
+
 # Build deterministic IPv4 host mappings for SMB mDNS targets so smbclient
 # does not pick unusable link-local addresses.
 if command -v avahi-browse >/dev/null 2>&1; then

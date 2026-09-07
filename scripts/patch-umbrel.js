@@ -930,6 +930,58 @@ function patchMachineType() {
       '  <on_crash>restart</on_crash>\n  <devices>\n',
     );
   });
+
+  // libvirt's clean-traffic nwfilter invokes ebtables to install ARP/MAC filtering rules.
+  // In a Docker container environment (with ebtables-nft), user-defined chain creation
+  // fails, breaking every VM creation with "RULE_APPEND failed: rule in chain J-vnetX-arp-mac".
+  // The guest is already on an isolated bridge inside Docker's network namespace, so drop it.
+  patchFile('packages/umbreld/source/modules/machines/domain.ts', (text) => {
+    return text.replace(
+      /\t\t\t<filterref filter='clean-traffic'><parameter name='IP' value='\${escapeXml\(definition\.ipAddress\)}'\/><\/filterref>\n/,
+      '',
+    );
+  });
+
+  // If a user creates a machine immediately after boot, activateLibvirt() may still be
+  // probing libvirt in the background. Await activation in create() instead of throwing
+  // [virtualization-unavailable].
+  patchFile('packages/umbreld/source/modules/machines/machines.ts', (text) => {
+    return text.replace(
+      "\t\tthis.#assertBackupIdle()\n\t\tif (!this.#libvirt.available) throw new Error('[virtualization-unavailable]')",
+      "\t\tthis.#assertBackupIdle()\n\t\tawait this.#activateLibvirt()\n\t\tif (!this.#libvirt.available) throw new Error('[virtualization-unavailable]')",
+    );
+  });
+}
+
+function patchWindows98IsoExtraction() {
+  // Official Windows 98 SE ISOs (e.g. retail/OEM) contain cross-directory hard links
+  // (e.g. win98/smartdrv.exe pointing to tools/oldmsdos/smartdrv.exe).
+  // bsdtar fails with exit code 1 ("Hard-link target does not exist") when
+  // extracting only the win98 subdirectory. Fall back to xorriso to extract
+  // the directory cleanly and restore write permissions.
+  patchFile('packages/umbreld/source/modules/machines/windows-image.ts', (text) => {
+    const needle = "\t\t\tawait execa('bsdtar', ['-xf', source, '-C', overlay, win98], installCommandOptions(signal))\n";
+    if (!text.includes(needle)) return text;
+    const replacement =
+      "\t\t\ttry {\n" +
+      "\t\t\t\tawait execa('bsdtar', ['-xf', source, '-C', overlay, win98], installCommandOptions(signal))\n" +
+      "\t\t\t} catch {\n" +
+      "\t\t\t\tawait fse.remove(nodePath.join(overlay, win98)).catch(() => {})\n" +
+      "\t\t\t\tawait execa(\n" +
+      "\t\t\t\t\t'xorriso',\n" +
+      "\t\t\t\t\t['-osirrox', 'on', '-indev', source, '-extract', `/${win98}`, nodePath.join(overlay, win98)],\n" +
+      "\t\t\t\t\tinstallCommandOptions(signal),\n" +
+      "\t\t\t\t).catch(() =>\n" +
+      "\t\t\t\t\texeca(\n" +
+      "\t\t\t\t\t\t'xorriso',\n" +
+      "\t\t\t\t\t\t['-osirrox', 'on', '-indev', source, '-extract', `/${win98.toLowerCase()}`, nodePath.join(overlay, win98)],\n" +
+      "\t\t\t\t\t\tinstallCommandOptions(signal),\n" +
+      "\t\t\t\t\t),\n" +
+      "\t\t\t\t)\n" +
+      "\t\t\t\tawait execa('chmod', ['-R', 'u+w', nodePath.join(overlay, win98)], {reject: false})\n" +
+      "\t\t\t}\n";
+    return text.replace(needle, replacement);
+  });
 }
 
 function patchMdnsAdvertisement() {
@@ -967,6 +1019,7 @@ function run() {
   patchLanIngressFib();
   patchMdnsAdvertisement();
   patchMachineType();
+  patchWindows98IsoExtraction();
   patchDurableFilesystem();
   patchDbusAndFilesServices();
   patchNetworkStorage();
