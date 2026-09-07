@@ -610,7 +610,24 @@ function patchDbusAndFilesServices() {
 
   patchFile('packages/umbreld/source/modules/files/samba.ts', (text) => {
     if (!text.includes("const UMBREL_DOCKER_MODE = process.env.UMBREL_DOCKER_MODE === 'true'")) {
-      const constants = "\nconst UMBREL_DOCKER_MODE = process.env.UMBREL_DOCKER_MODE === 'true'\n";
+      // The container runs with --pid=host, so process *names* are not a safe way to
+      // find our own daemons: `pgrep -x smbd` matches an smbd belonging to the host
+      // (a NAS already serving SMB), and `pkill -x smbd` would kill it. Only the pid
+      // in our own mount namespace's pidfile is ours. entry.sh takes the same care
+      // with dbus/avahi for exactly this reason.
+      const constants =
+        "\nconst UMBREL_DOCKER_MODE = process.env.UMBREL_DOCKER_MODE === 'true'\n" +
+        "\n// True only when an smbd inside *this* namespace answers, which is precisely\n" +
+        "// what `smbcontrol smbd reload-config` needs. A host smbd cannot answer here.\n" +
+        "const smbdReachable = () => $`smbcontrol smbd ping`.then(() => true).catch(() => false)\n" +
+        "\n// Stop only the smbd we started. Never `pkill -x smbd` under --pid=host.\n" +
+        "const stopOwnSmbd = async () => {\n" +
+        "\tconst pid = await fse\n" +
+        "\t\t.readFile('/run/samba/smbd.pid', 'utf8')\n" +
+        "\t\t.then((contents) => Number.parseInt(contents.trim(), 10))\n" +
+        "\t\t.catch(() => Number.NaN)\n" +
+        "\tif (Number.isInteger(pid) && pid > 0) process.kill(pid, 'SIGTERM')\n" +
+        "}\n";
       text = insertAfterImportBlock(text, constants);
     }
 
@@ -638,7 +655,7 @@ function patchDbusAndFilesServices() {
         // below as a $-prefixed String.replace substitution pattern (e.g. $` means
         // "text before the match" and would otherwise duplicate the whole file).
         () =>
-          "\tasync stop() {\n\t\tthis.logger.log('Stopping samba')\n\t\tthis.#removeFileChangeListener?.()\n\t\tthis.#removeExternalStorageChangeListener?.()\n\n\t\tif (UMBREL_DOCKER_MODE) {\n\t\t\tawait $`smbcontrol all shutdown`.catch(async (error) => {\n\t\t\t\tthis.logger.error('Failed to stop samba via smbcontrol', error)\n\t\t\t\tawait $`pkill -x smbd`.catch((killError) => this.logger.error('Failed to stop samba', killError))\n\t\t\t})\n\t\t\tawait $`pkill -x wsdd2`.catch(() => {})\n\t\t\treturn\n\t\t}\n\n\t\tawait $`systemctl stop smbd`.catch((error) => this.logger.error('Failed to stop samba', error))\n\t\tawait $`systemctl stop wsdd2`.catch((error) => this.logger.error('Failed to stop wsdd2', error))\n\t}\n",
+          "\tasync stop() {\n\t\tthis.logger.log('Stopping samba')\n\t\tthis.#removeFileChangeListener?.()\n\t\tthis.#removeExternalStorageChangeListener?.()\n\n\t\tif (UMBREL_DOCKER_MODE) {\n\t\t\tawait $`smbcontrol all shutdown`.catch(async (error) => {\n\t\t\t\tthis.logger.error('Failed to stop samba via smbcontrol', error)\n\t\t\t\tawait stopOwnSmbd().catch((killError) => this.logger.error('Failed to stop samba', killError))\n\t\t\t})\n\t\t\tawait $`pkill -x wsdd2`.catch(() => {})\n\t\t\treturn\n\t\t}\n\n\t\tawait $`systemctl stop smbd`.catch((error) => this.logger.error('Failed to stop samba', error))\n\t\tawait $`systemctl stop wsdd2`.catch((error) => this.logger.error('Failed to stop wsdd2', error))\n\t}\n",
       );
     }
 
@@ -646,7 +663,7 @@ function patchDbusAndFilesServices() {
       text = text.replace(
         "\t\tawait this.#closeResolvedShares(sharesToClose)\n\t\tawait fse.writeFile('/etc/samba/smb.conf', config)\n\n\t\tif (activeShares === 0) return await $`systemctl stop smbd`\n\n\t\tawait $`systemctl start smbd`\n\t\tawait $`smbcontrol smbd reload-config`\n\t\tawait $`systemctl start wsdd2`\n",
         () =>
-          "\t\tawait this.#closeResolvedShares(sharesToClose)\n\t\tawait fse.writeFile('/etc/samba/smb.conf', config)\n\n\t\tif (UMBREL_DOCKER_MODE) {\n\t\t\tif (activeShares === 0) {\n\t\t\t\tawait $`smbcontrol all shutdown`.catch(async () => {\n\t\t\t\t\tawait $`pkill -x smbd`.catch(() => {})\n\t\t\t\t})\n\t\t\t\tawait $`pkill -x wsdd2`.catch(() => {})\n\t\t\t\treturn\n\t\t\t}\n\n\t\t\tconst smbdRunning = await $`pgrep -x smbd`.then(() => true).catch(() => false)\n\t\t\tif (!smbdRunning) await $`smbd -D --configfile=/etc/samba/smb.conf`\n\t\t\tawait $`smbcontrol smbd reload-config`\n\n\t\t\tconst wsdd2Running = await $`pgrep -x wsdd2`.then(() => true).catch(() => false)\n\t\t\tif (!wsdd2Running) await $`wsdd2 -d`.catch((error) => this.logger.error('Failed to start wsdd2', error))\n\t\t\treturn\n\t\t}\n\n\t\tif (activeShares === 0) return await $`systemctl stop smbd`\n\n\t\tawait $`systemctl start smbd`\n\t\tawait $`smbcontrol smbd reload-config`\n\t\tawait $`systemctl start wsdd2`\n",
+          "\t\tawait this.#closeResolvedShares(sharesToClose)\n\t\tawait fse.writeFile('/etc/samba/smb.conf', config)\n\n\t\tif (UMBREL_DOCKER_MODE) {\n\t\t\tif (activeShares === 0) {\n\t\t\t\tawait $`smbcontrol all shutdown`.catch(async () => {\n\t\t\t\t\tawait stopOwnSmbd().catch(() => {})\n\t\t\t\t})\n\t\t\t\tawait $`pkill -x wsdd2`.catch(() => {})\n\t\t\t\treturn\n\t\t\t}\n\n\t\t\tif (!(await smbdReachable())) {\n\t\t\t\tawait $`smbd -D --configfile=/etc/samba/smb.conf`\n\t\t\t\t// smbd backgrounds before its messaging socket accepts commands.\n\t\t\t\tfor (let attempt = 0; attempt < 50; attempt++) {\n\t\t\t\t\tif (await smbdReachable()) break\n\t\t\t\t\tawait new Promise((resolve) => globalThis.setTimeout(resolve, 100))\n\t\t\t\t}\n\t\t\t}\n\t\t\tawait $`smbcontrol smbd reload-config`\n\n\t\t\tconst wsdd2Running = await $`pgrep -x wsdd2`.then(() => true).catch(() => false)\n\t\t\tif (!wsdd2Running) await $`wsdd2 -d`.catch((error) => this.logger.error('Failed to start wsdd2', error))\n\t\t\treturn\n\t\t}\n\n\t\tif (activeShares === 0) return await $`systemctl stop smbd`\n\n\t\tawait $`systemctl start smbd`\n\t\tawait $`smbcontrol smbd reload-config`\n\t\tawait $`systemctl start wsdd2`\n",
       );
     }
 
@@ -654,7 +671,7 @@ function patchDbusAndFilesServices() {
       text = text.replace(
         "\tasync #restartSambaForRevocation(cause: unknown) {\n\t\tthis.logger.error('Failed to target a Samba session; restarting smbd to guarantee revocation', cause)\n\t\ttry {\n\t\t\tawait $`systemctl restart smbd`\n\t\t} catch (restartError) {\n\t\t\tthrow new AggregateError([cause, restartError], 'Failed to revoke active Samba sessions')\n\t\t}\n\t}\n",
         () =>
-          "\tasync #restartSambaForRevocation(cause: unknown) {\n\t\tthis.logger.error('Failed to target a Samba session; restarting smbd to guarantee revocation', cause)\n\t\ttry {\n\t\t\tif (UMBREL_DOCKER_MODE) {\n\t\t\t\tawait $`smbcontrol all shutdown`.catch(() => $`pkill -x smbd`.catch(() => {}))\n\t\t\t\tawait $`smbd -D --configfile=/etc/samba/smb.conf`\n\t\t\t} else {\n\t\t\t\tawait $`systemctl restart smbd`\n\t\t\t}\n\t\t} catch (restartError) {\n\t\t\tthrow new AggregateError([cause, restartError], 'Failed to revoke active Samba sessions')\n\t\t}\n\t}\n",
+          "\tasync #restartSambaForRevocation(cause: unknown) {\n\t\tthis.logger.error('Failed to target a Samba session; restarting smbd to guarantee revocation', cause)\n\t\ttry {\n\t\t\tif (UMBREL_DOCKER_MODE) {\n\t\t\t\tawait $`smbcontrol all shutdown`.catch(() => stopOwnSmbd().catch(() => {}))\n\t\t\t\tawait $`smbd -D --configfile=/etc/samba/smb.conf`\n\t\t\t} else {\n\t\t\t\tawait $`systemctl restart smbd`\n\t\t\t}\n\t\t} catch (restartError) {\n\t\t\tthrow new AggregateError([cause, restartError], 'Failed to revoke active Samba sessions')\n\t\t}\n\t}\n",
       );
     }
 

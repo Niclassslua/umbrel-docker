@@ -91,7 +91,11 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     rm -f /etc/apt/apt.conf.d/docker-clean; \
   set -eu \
   && apt-get update -y \
-  && apt-get --no-install-recommends -y install sudo iproute2 iputils-ping curl ca-certificates procps whois dbus avahi-daemon avahi-utils samba smbclient cifs-utils wsdd2 nftables \
+  && apt-get --no-install-recommends -y install sudo iproute2 iputils-ping curl ca-certificates procps whois dbus avahi-daemon avahi-utils samba samba-vfs-modules smbclient cifs-utils wsdd2 nftables \
+  # samba-vfs-modules provides catia, fruit and streams_xattr. umbreld's generated
+  # smb.conf always requests them for macOS compatibility, and Samba refuses every
+  # connection (including IPC$) when a listed VFS module is missing. It is only a
+  # Recommends of samba, so --no-install-recommends drops it unless named here.
   && apt-get --no-install-recommends -y install python3 jq rsync gettext-base gnupg openssl tini unzip imagemagick libimage-exiftool-perl ffmpeg \
   # Photos requires ExifTool for image metadata and FFprobe for video metadata;
   # ImageMagick also uses FFmpeg to generate video thumbnails.
