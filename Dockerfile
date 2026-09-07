@@ -76,6 +76,7 @@ ENV NODE_ENV=production
 
 # We need to duplicate this such that we can also use the argument below.
 ARG TARGETARCH=amd64
+ARG DEBIAN_VERSION
 ARG YQ_VERSION
 ARG NODE_VERSION
 ARG RCLONE_VERSION
@@ -91,7 +92,17 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
   set -eu \
   && apt-get update -y \
   && apt-get --no-install-recommends -y install sudo iproute2 iputils-ping curl ca-certificates procps whois dbus avahi-daemon avahi-utils samba smbclient cifs-utils wsdd2 nftables \
-  && apt-get --no-install-recommends -y install python3 jq rsync gettext-base gnupg openssl tini unzip imagemagick \
+  && apt-get --no-install-recommends -y install python3 jq rsync gettext-base gnupg openssl tini unzip imagemagick libimage-exiftool-perl ffmpeg \
+  # Photos requires ExifTool for image metadata and FFprobe for video metadata;
+  # ImageMagick also uses FFmpeg to generate video thumbnails.
+  && exiftool -ver && ffprobe -version && ffmpeg -version \
+  # Bookworm's libheif 1.15 cannot decode some newer iPhone HEIC files.
+  # Install its official backport with the HEVC decoder plugin.
+  && if [ "$DEBIAN_VERSION" = "bookworm" ]; then \
+       printf '%s\n' 'deb https://deb.debian.org/debian bookworm-backports main' > /etc/apt/sources.list.d/umbrel-bookworm-backports.list \
+       && apt-get update -y \
+       && apt-get --no-install-recommends -y -t bookworm-backports install libheif1 libheif-plugin-libde265; \
+     fi \
   && apt-get --no-install-recommends -y install qemu-system-x86 qemu-system-arm qemu-utils libvirt-daemon-system libvirt-clients dnsmasq-base swtpm swtpm-tools cloud-image-utils ovmf qemu-efi-aarch64 \
   && curl -fsSL https://download.docker.com/linux/debian/gpg | gpg --dearmor -o /usr/share/keyrings/docker.gpg \
   && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker.gpg] https://download.docker.com/linux/debian bookworm stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null \
