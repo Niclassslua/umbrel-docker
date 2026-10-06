@@ -311,30 +311,116 @@ function patchUpdateModules() {
     "\t}\n" +
     "\treturn 0\n" +
     "}\n\n" +
-    "function getDockerUpdateStatePath() {\n" +
+    "function getDockerStateDirectory() {\n" +
     "\tconst dataDirectory = process.env.UMBREL_DATA_DIR\n" +
     "\tif (!dataDirectory) return null\n" +
-    "\treturn `${dataDirectory}/.umbrel-docker/update-state.json`\n" +
+    "\treturn `${dataDirectory}/.umbrel-docker`\n" +
     "}\n\n" +
-    "function resolveDockerUpdateStatus() {\n" +
+    "function getDockerUpdateStatePath() {\n" +
+    "\tconst stateDirectory = getDockerStateDirectory()\n" +
+    "\tif (!stateDirectory) return null\n" +
+    "\treturn `${stateDirectory}/update-state.json`\n" +
+    "}\n\n" +
+    "// The host agent rewrites this file with a unix timestamp every few seconds\n" +
+    "// for as long as it runs, including while an update is in progress.\n" +
+    "const DOCKER_AGENT_HEARTBEAT_MAX_AGE_MS = 30_000\n" +
+    "// After a host update fails, keep reporting 'updating' for a while so the UI\n" +
+    "// shows the error cover instead of silently reloading back to the desktop.\n" +
+    "const DOCKER_FAILED_UPDATE_HOLD_MS = 3 * 60_000\n\n" +
+    "function isDockerUpdateAgentAlive() {\n" +
+    "\tconst stateDirectory = getDockerStateDirectory()\n" +
+    "\tif (!stateDirectory) return false\n" +
+    "\ttry {\n" +
+    "\t\tconst heartbeat = Number(fse.readFileSync(`${stateDirectory}/update-agent.heartbeat`, 'utf8').trim())\n" +
+    "\t\tif (!Number.isFinite(heartbeat)) return false\n" +
+    "\t\treturn Date.now() - heartbeat * 1000 < DOCKER_AGENT_HEARTBEAT_MAX_AGE_MS\n" +
+    "\t} catch (error) {\n" +
+    "\t\treturn false\n" +
+    "\t}\n" +
+    "}\n\n" +
+    "function writeDockerUpdateState(state: UpdateStatus & {version?: string; channel?: string}) {\n" +
+    "\tconst statePath = getDockerUpdateStatePath()\n" +
+    "\tif (!statePath) return\n" +
+    "\tconst tmpPath = `${statePath}.tmp.${process.pid}`\n" +
+    "\tfse.ensureDirSync(getDockerStateDirectory()!)\n" +
+    "\tfse.writeJsonSync(tmpPath, {version: null, channel: null, ...state, updatedAt: new Date().toISOString()})\n" +
+    "\tfse.moveSync(tmpPath, statePath, {overwrite: true})\n" +
+    "}\n\n" +
+    "type DockerUpdateState = {status: UpdateStatus; updatedAtMs: number | null; readAtMs: number}\n\n" +
+    "// The host replaces the state file by rename on every progress write. Through\n" +
+    "// a macOS bind mount, about 1 in 100 reads lands mid-swap and sees half-written\n" +
+    "// JSON. Reusing the last good read for a moment keeps the UI from flashing the\n" +
+    "// queued message or briefly seeing 'running' and reloading mid-update.\n" +
+    "const DOCKER_STATE_READ_GRACE_MS = 15_000\n" +
+    "let lastDockerUpdateState: DockerUpdateState | null = null\n\n" +
+    "function readDockerUpdateState(): DockerUpdateState | null {\n" +
     "\tif (process.env.UMBREL_DOCKER_MODE !== 'true') return null\n" +
     "\tconst statePath = getDockerUpdateStatePath()\n" +
-    "\tif (!statePath || !fse.existsSync(statePath)) return null\n" +
+    "\tif (!statePath) return null\n" +
+    "\tlet state: Partial<UpdateStatus> & {error?: unknown; updatedAt?: unknown}\n" +
     "\ttry {\n" +
-    "\t\tconst state = fse.readJsonSync(statePath) as Partial<UpdateStatus> & {error?: unknown}\n" +
-    "\t\tconst next: UpdateStatus = {...updateStatus}\n" +
-    "\t\tif (typeof state.running === 'boolean') next.running = state.running\n" +
-    "\t\tif (typeof state.progress === 'number' && Number.isFinite(state.progress)) {\n" +
-    "\t\t\tnext.progress = Math.max(0, Math.min(100, Math.floor(state.progress)))\n" +
-    "\t\t}\n" +
-    "\t\tif (typeof state.description === 'string') next.description = state.description\n" +
-    "\t\tif (typeof state.error === 'string') next.error = state.error\n" +
-    "\t\tif (state.error === false) next.error = false\n" +
-    "\t\tif (state.error === true) next.error = 'Update failed'\n" +
-    "\t\treturn next\n" +
+    "\t\tstate = fse.readJsonSync(statePath)\n" +
     "\t} catch (error) {\n" +
+    "\t\tif (lastDockerUpdateState && Date.now() - lastDockerUpdateState.readAtMs < DOCKER_STATE_READ_GRACE_MS) {\n" +
+    "\t\t\treturn lastDockerUpdateState\n" +
+    "\t\t}\n" +
     "\t\treturn null\n" +
     "\t}\n" +
+    "\tconst next: UpdateStatus = {...updateStatus}\n" +
+    "\tif (typeof state.running === 'boolean') next.running = state.running\n" +
+    "\tif (typeof state.progress === 'number' && Number.isFinite(state.progress)) {\n" +
+    "\t\tnext.progress = Math.max(0, Math.min(100, Math.floor(state.progress)))\n" +
+    "\t}\n" +
+    "\tif (typeof state.description === 'string') next.description = state.description\n" +
+    "\tif (typeof state.error === 'string') next.error = state.error\n" +
+    "\tif (state.error === false) next.error = false\n" +
+    "\tif (state.error === true) next.error = 'Update failed'\n" +
+    "\tconst updatedAtMs = typeof state.updatedAt === 'string' ? Date.parse(state.updatedAt) : NaN\n" +
+    "\t// A run the agent never finished (agent killed, host rebooted) would\n" +
+    "\t// otherwise keep the UI on the updating cover forever.\n" +
+    "\tif (next.running && !isDockerUpdateAgentAlive()) {\n" +
+    "\t\tnext.running = false\n" +
+    "\t\tnext.error = \"The host update agent stopped responding. Check './umbrelctl agent logs' on the host.\"\n" +
+    "\t}\n" +
+    "\tlastDockerUpdateState = {status: next, updatedAtMs: Number.isFinite(updatedAtMs) ? updatedAtMs : null, readAtMs: Date.now()}\n" +
+    "\treturn lastDockerUpdateState\n" +
+    "}\n\n" +
+    "function resolveDockerUpdateStatus() {\n" +
+    "\treturn readDockerUpdateState()?.status ?? null\n" +
+    "}\n\n" +
+    "export function getDockerSystemStatusOverride(): 'updating' | null {\n" +
+    "\tconst state = readDockerUpdateState()\n" +
+    "\tif (!state) return null\n" +
+    "\tif (state.status.running) return 'updating'\n" +
+    "\tif (state.status.error && state.updatedAtMs !== null && Date.now() - state.updatedAtMs < DOCKER_FAILED_UPDATE_HOLD_MS) {\n" +
+    "\t\treturn 'updating'\n" +
+    "\t}\n" +
+    "\treturn null\n" +
+    "}\n\n" +
+    "export function getDockerUpdateNotice() {\n" +
+    "\tconst note = isDockerUpdateAgentAlive()\n" +
+    "\t\t? 'Installing backs up your data, rebuilds the umbrelOS image on the host and recreates this container. This can take a while; the page reloads by itself when it is done.'\n" +
+    "\t\t: '**The host update agent is not running**, so installing from here will fail. Start it on the host with `./umbrelctl agent start --daemon`.'\n" +
+    "\treturn `\\n\\n---\\n\\n**Docker mode:** ${note}`\n" +
+    "}\n\n" +
+    "const dockerReleaseNotesCache = new Map<string, string>()\n\n" +
+    "async function fetchDockerReleaseNotes(version: string) {\n" +
+    "\tconst cached = dockerReleaseNotesCache.get(version)\n" +
+    "\tif (cached !== undefined) return cached\n" +
+    "\tfor (const tag of [version, `v${version}`]) {\n" +
+    "\t\tconst result = await fetch(`https://api.github.com/repos/getumbrel/umbrel/releases/tags/${tag}`, {\n" +
+    "\t\t\theaders: {Accept: 'application/vnd.github+json', 'User-Agent': 'umbrel-docker'},\n" +
+    "\t\t})\n" +
+    "\t\tif (result.status === 404) continue\n" +
+    "\t\t// Rate limited or GitHub down: don't cache, try again on the next check\n" +
+    "\t\tif (!result.ok) return ''\n" +
+    "\t\tconst release = (await result.json()) as {body?: unknown}\n" +
+    "\t\tconst notes = typeof release.body === 'string' ? release.body : ''\n" +
+    "\t\tdockerReleaseNotesCache.set(version, notes)\n" +
+    "\t\treturn notes\n" +
+    "\t}\n" +
+    "\tdockerReleaseNotesCache.set(version, '')\n" +
+    "\treturn ''\n" +
     "}\n\n" +
     "async function resolveLatestDockerRelease(channel: string) {\n" +
     "\tif (channel !== 'beta') return null\n" +
@@ -356,7 +442,7 @@ function patchUpdateModules() {
     "\treturn {\n" +
     "\t\tversion: latest,\n" +
     "\t\tname: `umbrelOS ${latest}`,\n" +
-    "\t\treleaseNotes: `Docker mode: use the host update agent (\\'umbrelctl agent\\') or run 'bash ./umbrelctl update --ref ${latest}'.`,\n" +
+    "\t\treleaseNotes: await fetchDockerReleaseNotes(latest).catch(() => ''),\n" +
     "\t\tupdateScript: `https://raw.githubusercontent.com/getumbrel/umbrel/${latest}/scripts/update-script`,\n" +
     "\t}\n" +
     "}\n";
@@ -380,7 +466,7 @@ function patchUpdateModules() {
     "\t\tumbreld.logger.error(`Failed to get release channel`, error)\n" +
     "\t}\n";
 
-  const dockerGuardMarker = 'Docker mode update request queued for host agent';
+  const dockerGuardMarker = 'Waiting for the host update agent to start the update';
   const dockerGuard =
     "\tif (process.env.UMBREL_DOCKER_MODE === 'true') {\n" +
     "\t\tlet targetVersion = '<version>'\n" +
@@ -397,10 +483,28 @@ function patchUpdateModules() {
     "\t\t} catch (error) {\n" +
     "\t\t\tumbreld.logger.error('Failed to resolve release channel in docker mode', error)\n" +
     "\t\t}\n" +
-    "\t\tconst updateCommand =\n" +
-    "\t\t\ttargetVersion === '<version>'\n" +
-    "\t\t\t\t? 'bash ./umbrelctl update --ref <version>'\n" +
-    "\t\t\t\t: `bash ./umbrelctl update --ref ${targetVersion}`\n" +
+    "\t\tconst updateCommand = `./umbrelctl update --ref ${targetVersion}`\n" +
+    "\t\tconst failDockerUpdate = (error: string) => {\n" +
+    "\t\t\tconst status = {running: false, progress: 0, description: '', error}\n" +
+    "\t\t\tsetUpdateStatus(status)\n" +
+    "\t\t\ttry {\n" +
+    "\t\t\t\twriteDockerUpdateState(status)\n" +
+    "\t\t\t} catch (writeError) {\n" +
+    "\t\t\t\tumbreld.logger.error('Failed to write docker mode update state', writeError)\n" +
+    "\t\t\t}\n" +
+    "\t\t\treturn false\n" +
+    "\t\t}\n" +
+    "\t\tif (targetVersion === '<version>') {\n" +
+    "\t\t\treturn failDockerUpdate('Could not determine which umbrelOS version to install. Try again in a moment.')\n" +
+    "\t\t}\n" +
+    "\t\tif (!isDockerUpdateAgentAlive()) {\n" +
+    "\t\t\treturn failDockerUpdate(\n" +
+    "\t\t\t\t`The host update agent is not running. Start it on the host with './umbrelctl agent start --daemon' and retry, or run '${updateCommand}' there.`,\n" +
+    "\t\t\t)\n" +
+    "\t\t}\n" +
+    "\t\t// A second click (or Retry) while the host is still working must not\n" +
+    "\t\t// queue another request or reset the progress the agent is reporting.\n" +
+    "\t\tif (readDockerUpdateState()?.status.running) return true\n" +
     "\t\tconst requestDirectory = `${umbreld.dataDirectory}/.umbrel-docker`\n" +
     "\t\tconst requestFile = `${requestDirectory}/update-request.json`\n" +
     "\t\tconst requestPayload = {\n" +
@@ -410,24 +514,22 @@ function patchUpdateModules() {
     "\t\t\tsource: 'umbrelos-ui',\n" +
     "\t\t}\n" +
     "\t\ttry {\n" +
+    "\t\t\t// Write the state before the request so the agent's own progress\n" +
+    "\t\t\t// writes can never be overwritten by this initial one.\n" +
+    "\t\t\tconst queuedStatus = {\n" +
+    "\t\t\t\trunning: true,\n" +
+    "\t\t\t\tprogress: 2,\n" +
+    "\t\t\t\tdescription: `Waiting for the host update agent to start the update to umbrelOS ${targetVersion}`,\n" +
+    "\t\t\t\terror: false as const,\n" +
+    "\t\t\t}\n" +
+    "\t\t\twriteDockerUpdateState({...queuedStatus, version: targetVersion, channel: targetChannel})\n" +
+    "\t\t\tsetUpdateStatus(queuedStatus)\n" +
     "\t\t\tawait fse.ensureDir(requestDirectory)\n" +
     "\t\t\tawait fse.writeJson(requestFile, requestPayload, {spaces: 2})\n" +
-    "\t\t\tsetUpdateStatus({\n" +
-    "\t\t\t\trunning: true,\n" +
-    "\t\t\t\tprogress: 5,\n" +
-    "\t\t\t\tdescription: `Docker mode update request queued for host agent (${targetVersion})`,\n" +
-    "\t\t\t\terror: false,\n" +
-    "\t\t\t})\n" +
     "\t\t\treturn true\n" +
     "\t\t} catch (error) {\n" +
     "\t\t\tumbreld.logger.error('Failed to queue docker mode update request', error)\n" +
-    "\t\t\tsetUpdateStatus({\n" +
-    "\t\t\t\trunning: false,\n" +
-    "\t\t\t\tprogress: 0,\n" +
-    "\t\t\t\tdescription: 'Failed to queue docker mode update request',\n" +
-    "\t\t\t\terror: `Docker mode: run '${updateCommand}' on the host machine`,\n" +
-    "\t\t\t})\n" +
-    "\t\t\treturn false\n" +
+    "\t\t\treturn failDockerUpdate(`Could not queue the update for the host agent. Run '${updateCommand}' on the host instead.`)\n" +
     "\t\t}\n" +
     "\t}\n\n";
 
@@ -496,6 +598,35 @@ function patchSystemRoutes() {
         text = text.replace(
           /return \(await ctx\.umbreld\.store\.get\('settings\.releaseChannel'\)\) \|\| 'stable'/,
           "const storedChannel = await ctx.umbreld.store.get('settings.releaseChannel')\n\t\tif (storedChannel === 'beta' || storedChannel === 'stable') return storedChannel\n\t\treturn process.env.UMBREL_RELEASE_CHANNEL === 'beta' ? 'beta' : 'stable'",
+        );
+      }
+
+      // The host agent replaces this container mid-update, so the UI must learn
+      // about the update from the state file the agent writes, not from the
+      // in-memory status of a process that's about to be killed.
+      const updateImportPattern = /import \{([^}]*)\} from '(\.\/(?:system\/)?update\.js)'/;
+      const updateImport = text.match(updateImportPattern);
+      const updateModule = updateImport
+        ? path.join(root, path.dirname(relPath), updateImport[2].replace(/\.js$/, '.ts'))
+        : null;
+      const updateModuleExportsOverride =
+        updateModule !== null &&
+        fs.existsSync(updateModule) &&
+        fs.readFileSync(updateModule, 'utf8').includes('export function getDockerSystemStatusOverride');
+      if (!text.includes('getDockerSystemStatusOverride') && updateModuleExportsOverride) {
+        text = text.replace(
+          updateImportPattern,
+          (_match, names, from) =>
+            `import {${names.trim()}, getDockerSystemStatusOverride, getDockerUpdateNotice} from '${from}'`,
+        );
+        text = text.replace(
+          'status: publicProcedure.query(() => systemStatus),',
+          "status: publicProcedure.query(() => (systemStatus === 'running' && getDockerSystemStatusOverride()) || systemStatus),",
+        );
+        text = text.replace(
+          /\n([\t ]*)let \{version, name, releaseNotes\} = await getLatestRelease\(ctx\.umbreld\)\n/,
+          (match, indent) =>
+            `${match}${indent}if (process.env.UMBREL_DOCKER_MODE === 'true') releaseNotes = \`\${releaseNotes ?? ''}\${getDockerUpdateNotice()}\`\n`,
         );
       }
 

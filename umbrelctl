@@ -20,6 +20,7 @@ CONTAINER_NAME="umbrel"
 DATA_DIR="${SCRIPT_DIR}/umbrel-data"
 DATA_DIR_SET="false"
 HOST_PORT="80"
+HTTPS_PORT="443"
 ADVERTISE_IP=""
 ADVERTISE_IP_SET="false"
 STOP_TIMEOUT="60"
@@ -82,6 +83,7 @@ load_config() {
       CONTAINER_NAME)  CONTAINER_NAME="${value}" ;;
       DATA_DIR)        DATA_DIR="${value}" ;;
       HOST_PORT)       HOST_PORT="${value}" ;;
+      HTTPS_PORT)      HTTPS_PORT="${value}" ;;
       STOP_TIMEOUT)    STOP_TIMEOUT="${value}" ;;
       RUNTIME_PROFILE) RUNTIME_PROFILE="${value}" ;;
       RELEASE_CHANNEL) RELEASE_CHANNEL="${value}" ;;
@@ -147,6 +149,7 @@ Common options:
   --name <container>           Container name (default: umbrel)
   --data-dir <path>            Host directory mounted to /data
   --port <host-port>           Host port mapped to container 80 (default: 80)
+  --https-port <host-port>     Host port mapped to container 443 (default: 443)
   --advertise-ip <ip>          LAN IP to include in the local HTTPS cert (default: auto-detected)
   --stop-timeout <sec>         Stop timeout in seconds (default: 60)
   --runtime-profile <profile>  Runtime profile: minimal|compat (default: minimal)
@@ -407,11 +410,15 @@ monitor_backup_progress() {
   done
 }
 
+# The agent's working directory (request/state files, logs, heartbeat) changes
+# constantly during an update and is worthless to restore, so keep it out of
+# the backup instead of letting rsync trip over its temp files.
 backup_rsync_excludes() {
   local data_prefix="${DATA_DIR%/}/"
   local state_file="${UMBREL_UPDATE_STATE_FILE:-}"
 
-  if [[ -n "${state_file}" && "${state_file}" == "${data_prefix}"* ]]; then
+  printf '%s\n' "--exclude=/.umbrel-docker/"
+  if [[ -n "${state_file}" && "${state_file}" == "${data_prefix}"* && "${state_file}" != "${data_prefix}.umbrel-docker/"* ]]; then
     printf '%s\n' "--exclude=/${state_file#"${data_prefix}"}"
   fi
 }
@@ -480,6 +487,7 @@ parse_options() {
       --name)           CONTAINER_NAME="${2:?missing value for --name}"; shift 2 ;;
       --data-dir)       DATA_DIR="${2:?missing value for --data-dir}"; DATA_DIR_SET="true"; shift 2 ;;
       --port)           HOST_PORT="${2:?missing value for --port}"; shift 2 ;;
+      --https-port)     HTTPS_PORT="${2:?missing value for --https-port}"; shift 2 ;;
       --advertise-ip)   ADVERTISE_IP="${2:?missing value for --advertise-ip}"; ADVERTISE_IP_SET="true"; shift 2 ;;
       --stop-timeout)   STOP_TIMEOUT="${2:?missing value for --stop-timeout}"; shift 2 ;;
       --runtime-profile) RUNTIME_PROFILE="${2:?missing value for --runtime-profile}"; RUNTIME_PROFILE_SET="true"; shift 2 ;;
@@ -508,6 +516,174 @@ parse_options() {
 }
 
 # ── build ─────────────────────────────────────────────────────────────────────
+# Maps a BuildKit step header line to the update-progress milestone it starts,
+# as "floor|cap|key|default-seconds|description". Steps not listed don't move
+# the bar. The default duration is a rough cold-cache guess, used only until
+# this host has measured the step itself (see build_expected_seconds).
+build_step_rule() {
+  local line="$1"
+  local target="$2"
+  if [[ "${line}" =~ \[(ui-build|be-build|umbrelos)\ ([0-9]+)/([0-9]+)\] ]]; then
+    local stage="${BASH_REMATCH[1]}" step="${BASH_REMATCH[2]}" total="${BASH_REMATCH[3]}"
+    case "${stage}" in
+      umbrelos) (( step == 2 )) && printf "35|45|packages|90|Installing system packages" ;;
+      ui-build) (( step == total )) && printf "45|48|ui-deps|30|Building the web interface: installing dependencies" ;;
+      be-build) (( step == total )) && printf "68|76|backend|60|Building the umbrelOS backend" ;;
+    esac
+    return 0
+  fi
+  case "${line}" in
+    *"[source "*"ADD "*)         printf "30|32|source|20|Downloading umbrelOS %s source" "${target}" ;;
+    *"[source "*"patch-umbrel"*) printf "33|34|patch|5|Applying Docker-mode patches" ;;
+    *"exporting to image"*)      printf "76|80|export-layers|40|Finalizing the new image: writing layers" ;;
+  esac
+}
+
+# Phases inside a single BuildKit step, recognised from that step's own output.
+# Vite prints no running module count when it isn't attached to a terminal,
+# so "compiling" only advances by time.
+build_substep_rule() {
+  local family="$1" line="$2"
+  case "${family}:${line}" in
+    ui:*"> vite build"*)        printf "48|65|ui-compile|120|Building the web interface: compiling" ;;
+    ui:*"modules transformed"*) printf "65|68|ui-bundle|10|Building the web interface: bundling" ;;
+    export:*" unpacking to "*)  [[ "${line}" != *" done" ]] && printf "80|82|export-unpack|10|Finalizing the new image: unpacking" ;;
+  esac
+  return 0
+}
+
+build_timings_file() {
+  [[ -n "${UMBREL_UPDATE_STATE_FILE:-}" ]] || return 0
+  printf "%s/build-timings" "$(dirname "${UMBREL_UPDATE_STATE_FILE}")"
+}
+
+# How long a step took the last time this host actually ran it (not cached),
+# falling back to the rule's default on the first build.
+build_expected_seconds() {
+  local key="$1" fallback="$2" file seconds=""
+  file="$(build_timings_file)"
+  [[ -n "${file}" && -f "${file}" ]] && seconds="$(awk -v k="${key}" '$1 == k { print $2 }' "${file}" 2>/dev/null | tail -n1)"
+  [[ "${seconds}" =~ ^[0-9]+$ ]] && (( seconds >= 5 )) || seconds="${fallback}"
+  printf "%s" "${seconds}"
+}
+
+# Called with "key=seconds" pairs measured during this build. Steps served from
+# the build cache finish in under a few seconds and would teach the bar to rush,
+# so only real runs are kept.
+save_build_timings() {
+  local file entry key seconds tmp
+  file="$(build_timings_file)"
+  [[ -n "${file}" ]] || return 0
+  tmp="$(mktemp "${file}.tmp.XXXXXX" 2>/dev/null)" || return 0
+  [[ -f "${file}" ]] && cp "${file}" "${tmp}"
+  for entry in "$@"; do
+    key="${entry%%=*}"
+    seconds="${entry#*=}"
+    (( seconds >= 5 )) || continue
+    awk -v k="${key}" '$1 != k' "${tmp}" >"${tmp}.next" && mv "${tmp}.next" "${tmp}"
+    printf "%s %s\n" "${key}" "${seconds}" >>"${tmp}"
+  done
+  mv "${tmp}" "${file}" 2>/dev/null || rm -f "${tmp}"
+}
+
+# Looks up the phase family of a step id ("#12" or "12") in report_build_progress's
+# phased_ids, which is visible here through bash's dynamic scoping.
+id_family() {
+  local id="${1#\#}" family
+  family="${phased_ids#* ${id}:}"
+  printf "%s" "${family%% *}"
+}
+
+# Reads plain BuildKit output on stdin, passes it through unchanged, and keeps
+# the UI update state in step with the build. Several stages run in parallel,
+# so the bar follows the furthest step started and only ever moves forward.
+# Within a step it creeps toward the step's cap over the expected duration, and
+# the label carries a timer for the whole step, refreshed every second.
+report_build_progress() {
+  local target="$1"
+  local line id rule floor cap key expected desc now elapsed shown label creep
+  local progress=30 cur_floor=30 cur_cap=32 cur_key="source" cur_desc="Downloading umbrelOS ${target} source"
+  local cur_expected cur_start step_start last_write=0 last_label="" tracked=" " phased_ids=" "
+  local -a measured=()
+  cur_expected="$(build_expected_seconds source 20)"
+  cur_start="$(date +%s)"
+  step_start="${cur_start}"
+
+  # tracked holds " id:cap:key:start " for every step seen, so DONE lines can
+  # close the right step even when another one is the current focus.
+  # phased_ids holds " id:family " for steps split into phases (key "family-*").
+  while true; do
+    now="$(date +%s)"
+    if IFS= read -r -t 1 line; then
+      printf '%s\n' "${line}"
+      if [[ "${line}" =~ ^#([0-9]+)\ (DONE|CACHED) ]]; then
+        id="${BASH_REMATCH[1]}"
+        if [[ "${tracked}" == *" ${id}:"* ]]; then
+          local entry="${tracked#* ${id}:}"
+          entry="${entry%% *}"
+          IFS=':' read -r cap key floor <<<"${entry}"
+          if [[ "${key}" == *-* ]]; then
+            # A phased step's cap is its first phase's; the step ends at the
+            # last phase's cap, and that phase's time ends with the step.
+            local family="${key%%-*}"
+            [[ "${cur_key}" == "${family}"-* ]] && cap="${cur_cap}"
+            [[ "${BASH_REMATCH[2]}" == "DONE" && "${cur_key}" == "${family}"-* ]] && measured+=("${cur_key}=$(( now - cur_start ))")
+          elif [[ "${BASH_REMATCH[2]}" == "DONE" ]]; then
+            measured+=("${key}=$(( now - floor ))")
+          fi
+          (( cap > progress )) && progress="${cap}"
+        fi
+      elif [[ "${line}" =~ ^#([0-9]+)\  && "${phased_ids}" == *" ${BASH_REMATCH[1]}:"* ]] \
+        && rule="$(build_substep_rule "$(id_family "${BASH_REMATCH[1]}")" "${line}")" && [[ -n "${rule}" ]]; then
+        IFS='|' read -r floor cap key expected desc <<<"${rule}"
+        if (( floor > cur_floor )); then
+          [[ "${cur_key}" == "${key%%-*}"-* ]] && measured+=("${cur_key}=$(( now - cur_start ))")
+          cur_floor="${floor}" cur_cap="${cap}" cur_key="${key}" cur_desc="${desc}"
+          cur_expected="$(build_expected_seconds "${key}" "${expected}")"
+          cur_start="${now}"
+          (( floor > progress )) && progress="${floor}"
+        fi
+      elif [[ "${line}" =~ ^#([0-9]+)\ (\[|exporting\ to\ image) ]]; then
+        id="${BASH_REMATCH[1]}"
+        rule="$(build_step_rule "${line}" "${target}")"
+        if [[ -n "${rule}" && "${tracked}" != *" ${id}:"* ]]; then
+          IFS='|' read -r floor cap key expected desc <<<"${rule}"
+          tracked+="${id}:${cap}:${key}:${now} "
+          [[ "${key}" == *-* ]] && phased_ids+="${id}:${key%%-*} "
+          if (( floor >= cur_floor )); then
+            cur_floor="${floor}" cur_cap="${cap}" cur_key="${key}" cur_desc="${desc}"
+            cur_expected="$(build_expected_seconds "${key}" "${expected}")"
+            cur_start="${now}"
+            step_start="${now}"
+            (( floor > progress )) && progress="${floor}"
+          fi
+        fi
+      fi
+    elif (( $? <= 128 )); then
+      break
+    fi
+
+    elapsed=$(( now - cur_start ))
+    shown="${progress}"
+    if (( progress < cur_cap )); then
+      creep=$(( cur_floor + (cur_cap - cur_floor - 1) * elapsed / cur_expected ))
+      (( creep > cur_cap - 1 )) && creep=$(( cur_cap - 1 ))
+      (( creep > shown )) && shown="${creep}"
+    fi
+    elapsed=$(( now - step_start ))
+    label="${cur_desc}"
+    (( elapsed >= 5 )) && label="${cur_desc} ($(( elapsed / 60 )):$(printf '%02d' $(( elapsed % 60 ))))"
+    if [[ "${shown}|${label}" != "${last_label}" ]] && (( now > last_write )); then
+      write_update_state true "${shown}" "${label}" ""
+      last_label="${shown}|${label}"
+      last_write="${now}"
+    fi
+  done
+  [[ "${shown:-}|${label:-}" != "${last_label}" && -n "${label:-}" ]] && write_update_state true "${shown}" "${label}" ""
+  save_build_timings "${measured[@]}"
+  return 0
+}
+
 build_image() {
   ensure_image_default
   validate_runtime_profile
@@ -553,6 +729,7 @@ build_image() {
 
       local label
       args=(build)
+      [[ -n "${UMBREL_UPDATE_STATE_FILE:-}" ]] && args+=(--progress=plain)
       [[ "$NO_CACHE" == "true" ]] && args+=(--no-cache)
       [[ "$PULL" == "true" ]] && args+=(--pull)
       args+=(--build-arg "VERSION_ARG=${candidate}" --build-arg "NODE_VERSION=${node_version}")
@@ -564,7 +741,9 @@ build_image() {
       info "Building image ${IMAGE} from ref ${candidate} (Node ${node_version})"
       local build_log
       build_log="$(mktemp)"
-      if docker "${args[@]}" 2>&1 | tee "${build_log}"; then
+      local -a progress_filter=(cat)
+      [[ -n "${UMBREL_UPDATE_STATE_FILE:-}" ]] && progress_filter=(report_build_progress "${candidate#v}")
+      if docker "${args[@]}" 2>&1 | tee "${build_log}" | "${progress_filter[@]}"; then
         rm -f "${build_log}"
         return 0
       fi
@@ -579,6 +758,7 @@ build_image() {
   done
 
   err "Build failed for all ref candidates: ${candidates[*]}"
+  write_update_state false 0 "Build failed" "Building umbrelOS ${REF#v} failed. See './umbrelctl agent logs' on the host for details."
   exit 1
 }
 
@@ -700,7 +880,7 @@ run_new_container() {
     --security-opt systempaths=unconfined
     --device /dev/net/tun:/dev/net/tun
     -p "${HOST_PORT}:80"
-    -p "443:443"
+    -p "${HTTPS_PORT}:443"
     -p "139:139"
     -p "445:445"
     -p "3702:3702/tcp"
@@ -1111,7 +1291,7 @@ backups_restore() {
 
 # ── config ────────────────────────────────────────────────────────────────────
 config_show() {
-  local valid_keys=(REF CONTAINER_NAME DATA_DIR HOST_PORT ADVERTISE_IP STOP_TIMEOUT
+  local valid_keys=(REF CONTAINER_NAME DATA_DIR HOST_PORT HTTPS_PORT ADVERTISE_IP STOP_TIMEOUT
     RUNTIME_PROFILE RELEASE_CHANNEL HEALTH_TIMEOUT BACKUP_DIR
     BACKUP_ENABLED BACKUPS_KEEP)
 
@@ -1148,7 +1328,7 @@ config_set() {
     err "Usage: ./umbrelctl config set KEY VALUE"
     exit 1
   fi
-  local valid_keys=(REF CONTAINER_NAME DATA_DIR HOST_PORT ADVERTISE_IP STOP_TIMEOUT
+  local valid_keys=(REF CONTAINER_NAME DATA_DIR HOST_PORT HTTPS_PORT ADVERTISE_IP STOP_TIMEOUT
     RUNTIME_PROFILE RELEASE_CHANNEL HEALTH_TIMEOUT BACKUP_DIR
     BACKUP_ENABLED BACKUPS_KEEP)
   local k valid="false"
@@ -1357,7 +1537,7 @@ infer_data_dir_from_inspect() {
 
 backup_data_dir() {
   if [[ "$BACKUP_ENABLED" != "true" ]]; then
-    write_update_state true 15 "Skipping backup" ""
+    write_update_state true 28 "Skipping backup" ""
     return 0
   fi
 
@@ -1374,7 +1554,7 @@ backup_data_dir() {
   mkdir -p "${BACKUP_PATH}"
 
   info "Creating backup of ${DATA_DIR}"
-  write_update_state true 10 "Measuring backup size" ""
+  write_update_state true 8 "Measuring your data" ""
 
   local data_basename snapshot_root snapshot_data archive_file rsync_log tar_log
   local source_kib snapshot_kib progress_pid rsync_rc tar_rc
@@ -1394,7 +1574,7 @@ backup_data_dir() {
   mapfile -t rsync_excludes < <(backup_rsync_excludes)
 
   set +e
-  monitor_backup_progress "${snapshot_data}" "${source_kib}" 12 32 "Creating backup snapshot" &
+  monitor_backup_progress "${snapshot_data}" "${source_kib}" 8 20 "Backing up your data" &
   progress_pid=$!
   rsync -a --delete "${rsync_excludes[@]}" "${DATA_DIR}/" "${snapshot_data}/" > /dev/null 2>"${rsync_log}"
   rsync_rc=$?
@@ -1411,7 +1591,7 @@ backup_data_dir() {
     exit 1
   fi
   finish_backup_progress "Creating backup snapshot"
-  write_update_state true 32 "Backup snapshot complete" ""
+  write_update_state true 20 "Backing up your data (100%)" ""
   if (( rsync_rc == 24 )); then
     warn "Backup snapshot completed with transient file-change warnings (rsync exit code 24)."
     sed 's/^/WARN: /' "${rsync_log}" >&2
@@ -1423,7 +1603,7 @@ backup_data_dir() {
   (( snapshot_kib < 1 )) && snapshot_kib=1
 
   set +e
-  monitor_backup_progress "${archive_file}" "${snapshot_kib}" 34 45 "Creating backup archive" &
+  monitor_backup_progress "${archive_file}" "${snapshot_kib}" 20 28 "Compressing backup" &
   progress_pid=$!
   tar -C "${snapshot_root}" -cf "${archive_file}" "${data_basename}" 2>"${tar_log}"
   tar_rc=$?
@@ -1448,7 +1628,7 @@ backup_data_dir() {
     err "Backup archive is empty."
     exit 1
   fi
-  write_update_state true 45 "Backup created" ""
+  write_update_state true 28 "Backup saved" ""
   info "Backup created at ${BACKUP_PATH}"
 }
 
@@ -1526,22 +1706,21 @@ build_docker_run_args_from_inspect() {
   mapfile -t ports < <(jq -r '.[0].HostConfig.PortBindings | to_entries[]? | .key + "|" + (.value[0].HostPort // "") + "|" + (.value[0].HostIp // "")' "${inspect_file}")
   local has_https_port="false"
   for entry in "${ports[@]}"; do
-    local container_proto host_port host_ip container_port
+    local container_proto host_port host_ip
     container_proto="${entry%%|*}"
     host_port="$(printf "%s" "${entry}" | cut -d'|' -f2)"
     host_ip="$(printf "%s" "${entry}" | cut -d'|' -f3)"
-    container_port="${container_proto%/*}"
     [[ -z "$host_port" ]] && continue
     [[ "${container_proto}" == "443/tcp" ]] && has_https_port="true"
     if [[ -n "$host_ip" && "$host_ip" != "0.0.0.0" ]]; then
-      RESTORE_ARGS+=(-p "${host_ip}:${host_port}:${container_port}")
+      RESTORE_ARGS+=(-p "${host_ip}:${host_port}:${container_proto}")
     else
-      RESTORE_ARGS+=(-p "${host_port}:${container_port}")
+      RESTORE_ARGS+=(-p "${host_port}:${container_proto}")
     fi
   done
   # Older containers were created before HTTPS (443) was published; add it so the
   # iOS app's HTTPS reachability check doesn't hang and misreport "update required".
-  [[ "${has_https_port}" != "true" ]] && RESTORE_ARGS+=(-p "443:443")
+  [[ "${has_https_port}" != "true" ]] && RESTORE_ARGS+=(-p "${HTTPS_PORT}:443")
 
   local restart_name restart_max
   restart_name="$(jq -r '.[0].HostConfig.RestartPolicy.Name // empty' "${inspect_file}")"
@@ -1577,6 +1756,11 @@ wait_healthy() {
     if (( elapsed >= timeout )); then
       return 1
     fi
+    if [[ -n "${UPDATE_HEALTH_LABEL:-}" ]]; then
+      local health_progress=$(( 90 + elapsed / 10 ))
+      (( health_progress > 98 )) && health_progress=98
+      write_update_state true "${health_progress}" "${UPDATE_HEALTH_LABEL} (${elapsed}s)" ""
+    fi
 
     running="$(docker inspect -f '{{.State.Running}}' "${CONTAINER_NAME}" 2>/dev/null || printf "false")"
     state="$(docker inspect -f '{{.State.Status}}|{{.State.ExitCode}}|{{.State.Restarting}}' "${CONTAINER_NAME}" 2>/dev/null || printf "missing|-1|false")"
@@ -1608,10 +1792,25 @@ wait_healthy() {
   done
 }
 
+run_container_from_image() {
+  local image="$1" output
+  if output="$(docker run -d "${RESTORE_ARGS[@]}" "${image}" 2>&1)"; then
+    return 0
+  fi
+  # A failed run can leave a "Created" container behind that blocks the name.
+  docker rm -f "${CONTAINER_NAME}" >/dev/null 2>&1 || true
+  err "${output}"
+  return 1
+}
+
 rollback() {
   warn "Update failed. Rolling back to ${OLD_IMAGE}"
   docker rm -f "${CONTAINER_NAME}" >/dev/null 2>&1 || true
-  docker run -d "${RESTORE_ARGS[@]}" "${OLD_IMAGE}" >/dev/null
+  if ! run_container_from_image "${OLD_IMAGE}"; then
+    err "Rollback failed: could not start ${OLD_IMAGE}. Start it manually with './umbrelctl up --skip-build --image ${OLD_IMAGE}'."
+    write_update_state false 0 "Update failed" "The update failed and ${OLD_IMAGE} could not be restarted. Run './umbrelctl up --skip-build --image ${OLD_IMAGE}' on the host."
+    return 1
+  fi
   warn "Rollback completed."
   [[ -n "${BACKUP_PATH:-}" ]] && warn "Backup is available at ${BACKUP_PATH}"
 }
@@ -1645,26 +1844,48 @@ update_container() {
     return 0
   fi
 
+  local old_version="${OLD_IMAGE##*:}" new_version="${IMAGE##*:}"
+
+  write_update_state true 5 "Saving current container settings" ""
   backup_data_dir
-  write_update_state true 50 "Preparing target image" ""
+  if [[ "${IMAGE_SET}" == "true" && "${PULL}" == "true" ]]; then
+    write_update_state true 30 "Downloading umbrelOS ${new_version} image" ""
+  fi
   resolve_target_image
+  write_update_state true 82 "umbrelOS ${new_version} is ready to install" ""
 
   info "Stopping old container ${CONTAINER_NAME}"
-  write_update_state true 75 "Stopping old container" ""
+  write_update_state true 85 "Restarting into umbrelOS ${new_version}: this page will reconnect by itself" ""
+  # The UI is served by the container we're about to remove. Give it a few
+  # polls to pick up this message, which then stays on screen while it's down.
+  [[ -n "${UMBREL_UPDATE_STATE_FILE:-}" ]] && sleep 3
   docker rm -f "${CONTAINER_NAME}" >/dev/null
 
   info "Starting new container from ${IMAGE}"
-  write_update_state true 85 "Starting updated container" ""
-  docker run -d "${RESTORE_ARGS[@]}" "${IMAGE}" >/dev/null
-
-  write_update_state true 90 "Waiting for updated container to start" ""
-  if ! wait_healthy "${HEALTH_TIMEOUT}"; then
-    write_update_state false 0 "Update failed; rolling back" "Updated container failed health check"
+  write_update_state true 88 "Starting umbrelOS ${new_version}" ""
+  if ! run_container_from_image "${IMAGE}"; then
+    write_update_state true 88 "Update failed, restoring umbrelOS ${old_version}" ""
     rollback
+    write_update_state false 0 "Update failed" "umbrelOS ${new_version} could not be started, so umbrelOS ${old_version} was restored."
     exit 1
   fi
 
-  write_update_state false 100 "Update completed" ""
+  write_update_state true 90 "Waiting for umbrelOS ${new_version} to respond" ""
+  if ! UPDATE_HEALTH_LABEL="Waiting for umbrelOS ${new_version} to respond" wait_healthy "${HEALTH_TIMEOUT}"; then
+    write_update_state true 90 "Update failed, restoring umbrelOS ${old_version}" ""
+    rollback
+    write_update_state false 0 "Update failed" "umbrelOS ${new_version} did not start correctly within ${HEALTH_TIMEOUT}s, so umbrelOS ${old_version} was restored."
+    exit 1
+  fi
+
+  if [[ -n "${UMBREL_UPDATE_STATE_FILE:-}" ]]; then
+    # The new backend only answers once it's healthy, so without this hold the
+    # UI's first successful poll already sees the update finished and reloads
+    # straight to the desktop with no sign the update completed.
+    write_update_state true 100 "Update complete: loading umbrelOS ${new_version}" ""
+    sleep 5
+  fi
+  write_update_state false 100 "Update complete" ""
   info "Updated ${CONTAINER_NAME} from ${OLD_IMAGE} to ${IMAGE}"
   [[ -n "${BACKUP_PATH:-}" ]] && info "Backup kept at ${BACKUP_PATH}"
   if [[ "$FOLLOW_LOGS" == "true" ]]; then

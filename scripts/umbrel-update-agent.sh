@@ -18,6 +18,8 @@ REQUEST_FILE=""
 ACTIVE_FILE=""
 STATE_FILE=""
 PID_FILE=""
+HEARTBEAT_FILE=""
+HEARTBEAT_PID=""
 
 info() { printf "==> %s\n" "$*"; }
 warn() { printf "WARN: %s\n" "$*" >&2; }
@@ -79,6 +81,7 @@ init_paths() {
   ACTIVE_FILE="${REQUEST_DIR}/update-request.active.json"
   STATE_FILE="${REQUEST_DIR}/update-state.json"
   PID_FILE="${REQUEST_DIR}/update-agent.pid"
+  HEARTBEAT_FILE="${REQUEST_DIR}/update-agent.heartbeat"
 
   mkdir -p "${REQUEST_DIR}"
   if [[ -z "${LOG_FILE}" ]]; then
@@ -157,7 +160,7 @@ process_request_file() {
   fi
 
   log_line "request-start version=${version} channel=${channel} requested_at=${requested_at}"
-  write_state true 10 "Running host update to ${version}" "" "${version}" "${channel}"
+  write_state true 3 "Starting update to umbrelOS ${version}" "" "${version}" "${channel}"
 
   set +e
   UMBREL_UPDATE_STATE_FILE="${STATE_FILE}" \
@@ -173,12 +176,16 @@ process_request_file() {
 
   if (( rc == 0 )); then
     log_line "request-success version=${version} channel=${channel}"
-    write_state false 100 "Update to ${version} completed" "" "${version}" "${channel}"
+    write_state false 100 "Update complete" "" "${version}" "${channel}"
     mv -f "${file}" "$(request_archive_path completed)"
   else
     warn "Host update failed for version ${version} (exit ${rc})"
     log_line "request-failed version=${version} channel=${channel} exit=${rc}"
-    write_state false 0 "Update to ${version} failed" "Host update command failed (exit ${rc})" "${version}" "${channel}"
+    # umbrelctl usually records a specific reason ("Updated container failed
+    # health check"); only fall back to the exit code when it didn't.
+    local reason
+    reason="$(jq -r 'if (.error | type) == "string" then .error else empty end' "${STATE_FILE}" 2>/dev/null || true)"
+    write_state false 0 "Update to ${version} failed" "${reason:-Host update command failed (exit ${rc})}" "${version}" "${channel}"
     mv -f "${file}" "$(request_archive_path failed)"
   fi
 }
@@ -195,6 +202,21 @@ run_once() {
 
   mv -f "${REQUEST_FILE}" "${ACTIVE_FILE}"
   process_request_file "${ACTIVE_FILE}"
+}
+
+# umbreld reads this to tell whether anyone will pick up a UI update request,
+# and whether an in-flight update is still being driven. It runs in its own
+# loop so it keeps beating while a long `umbrelctl update` blocks the main one,
+# and stops by itself if this agent dies without running its EXIT trap.
+start_heartbeat() {
+  local agent_pid="$$"
+  (
+    while kill -0 "${agent_pid}" 2>/dev/null; do
+      date +%s >"${HEARTBEAT_FILE}.tmp" && mv -f "${HEARTBEAT_FILE}.tmp" "${HEARTBEAT_FILE}"
+      sleep 5
+    done
+  ) &
+  HEARTBEAT_PID=$!
 }
 
 agent_loop() {
@@ -244,7 +266,8 @@ main() {
   fi
 
   printf "%s\n" "$$" >"${PID_FILE}"
-  trap 'rm -f "${PID_FILE}"' EXIT
+  start_heartbeat
+  trap 'kill "${HEARTBEAT_PID}" 2>/dev/null || true; rm -f "${PID_FILE}" "${HEARTBEAT_FILE}"' EXIT
 
   log_line "agent-start container=${CONTAINER_NAME} data_dir=${DATA_DIR}"
   agent_loop

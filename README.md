@@ -89,7 +89,7 @@ Everything that should survive a rebuild lives under a couple of host paths — 
 | --- | --- |
 | `./umbrel-data/` | Persistent Umbrel data, mounted to `/data` in the container. |
 | `./umbrel-backups/` | Default location for pre-update backup archives. |
-| `./umbrel-data/.umbrel-docker/` | Update-agent requests, state, PID, and logs. |
+| `./umbrel-data/.umbrel-docker/` | Update-agent requests, state, PID, heartbeat, build timings, and logs. Excluded from update backups. |
 | `.umbrelctl.conf` | Optional local defaults written by `./umbrelctl config set`. |
 
 ## Common Commands
@@ -197,6 +197,16 @@ That something is the update agent, which watches the file and runs `./umbrelctl
 ```
 
 State and logs live in `<data-dir>/.umbrel-docker/`. While it works, the agent also writes live backup progress to `update-state.json`, so the Umbrel UI can keep showing a real progress bar instead of a spinner with no idea what's happening underneath it.
+
+With the agent running, the whole update can be done from Settings → Software update:
+
+- The update dialog shows the release's real notes (for beta releases, pulled from GitHub) plus a Docker-mode note saying whether the agent is reachable.
+- The agent writes a heartbeat to `update-agent.heartbeat` every few seconds. If it's missing or stale, "Install now" fails right away with instructions, instead of queueing a request nothing will pick up.
+- While the agent works, umbreld reports the system as `updating`, so the UI shows its normal progress cover through the backup, the image build, and the container swap. Once the new container is healthy, the page reloads by itself.
+- The progress cover names each step: backing up and compressing your data, downloading the new source, installing system packages, building the web interface (installing dependencies, compiling, bundling), building the backend, writing and unpacking the image, then swapping containers. Agent-driven builds run with plain BuildKit output so `umbrelctl` can follow along; long steps show a timer and creep forward using how long that step took on this host last time (`build-timings` in the agent directory).
+- If the update fails or rolls back, or the agent dies partway through, the cover shows the error and a retry button for a few minutes before returning to the desktop.
+
+The agent has to keep running for this to work, so after a host reboot start it again with `./umbrelctl agent start --daemon`, or run it from a systemd unit or launchd job.
 
 ### Backups
 
