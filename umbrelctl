@@ -1,4 +1,16 @@
 #!/usr/bin/env bash
+
+# This script needs bash 4.3+ (namerefs, mapfile). macOS still ships bash 3.2 as
+# /bin/bash, so re-exec under a newer one (e.g. Homebrew's) when it's installed.
+if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 3) )); then
+  for candidate in /opt/homebrew/bin/bash /usr/local/bin/bash; do
+    [[ -x "${candidate}" && "${candidate}" != "${BASH}" ]] && exec "${candidate}" "$0" "$@"
+  done
+  printf "ERROR: umbrelctl needs bash 4.3 or newer (found %s).\n" "${BASH_VERSION}" >&2
+  printf "On macOS: brew install bash\n" >&2
+  exit 1
+fi
+
 set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -1293,7 +1305,7 @@ run_update_agent() {
   [[ "${AGENT_DAEMON}" == "true" ]] && args+=(--daemon)
   [[ -n "${AGENT_LOG_FILE}" ]]      && args+=(--log-file "${AGENT_LOG_FILE}")
 
-  bash "${agent_script}" "${args[@]}"
+  "${BASH}" "${agent_script}" "${args[@]}"
 }
 
 # ── versions ──────────────────────────────────────────────────────────────────

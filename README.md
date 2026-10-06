@@ -46,7 +46,7 @@ At runtime, the container mounts your data directory to `/data` and the host's D
 ## Requirements
 
 - Docker Engine or Docker Desktop with the daemon running, and a socket at `/var/run/docker.sock`.
-- Bash, `git` (for `versions`), `jq` (updates/backups/agent), `rsync` (backups/restores).
+- Bash 4.3 or newer (macOS ships 3.2; `brew install bash` and `umbrelctl` picks it up automatically), `git` (for `versions`), `jq` (updates/backups/agent), `rsync` (backups/restores).
 - Network access during builds to GitHub, Debian mirrors, Docker's package repo, npm, Node.js, and yq release downloads.
 
 Run the built-in environment check before first use:
