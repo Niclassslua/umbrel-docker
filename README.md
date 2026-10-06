@@ -239,7 +239,7 @@ A backup is an rsync snapshot of `/data`, then tarred up; `update` reports progr
 
 Every place umbrelOS assumes it's talking to real hardware, the patches have to decide what to do instead — and that decision is the `minimal`/`compat` split.
 
-`minimal`, the default, takes the honest option: things that need hardware that genuinely isn't there report themselves as unavailable rather than pretending. Wi-Fi management stays off (the container doesn't own the host's radio), the Thunderbolt authorization monitor never starts (there's nothing to authorize), and CPU temperature reporting returns a flat "normal" instead of failing outright when it can't read a real sensor.
+`minimal`, the default, takes the honest option: things that need hardware that genuinely isn't there report themselves as unavailable rather than pretending. Wi-Fi management stays off (the container doesn't own the host's radio), the Thunderbolt authorization monitor never starts (there's nothing to authorize), the Storage Manager shows the host volume behind `/data` instead of erroring while it hunts for physical drives it can't see, and CPU temperature reporting returns a flat "normal" instead of failing outright when it can't read a real sensor.
 
 `compat` leaves more of that OS-level service behavior switched on, which is occasionally useful for debugging something that specifically expects a fuller environment — at the cost of reintroducing checks that assume hardware which, inside a container, still isn't there.
 

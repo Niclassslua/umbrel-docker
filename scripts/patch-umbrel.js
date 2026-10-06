@@ -829,6 +829,86 @@ function patchDurableFilesystem() {
   });
 }
 
+function patchStorageManager() {
+  // getDevices() resolves which physical disk backs / and /data via df + lsblk. In a
+  // container / is an overlay and /data is a bind mount whose source is either a host
+  // /dev node that doesn't exist in the container (Linux) or not a /dev path at all
+  // (Docker Desktop), so it throws and the Storage Manager only ever shows an error.
+  // The host owns the drives anyway (no SMART tools, no udev ids, no ZFS in here), so
+  // report none and let the UI fall back to the single-drive view, whose capacity
+  // comes from df on /data and works fine.
+  patchFile('packages/umbreld/source/modules/hardware/internal-storage.ts', (text) => {
+    if (!text.includes("const UMBREL_DOCKER_MODE = process.env.UMBREL_DOCKER_MODE === 'true'")) {
+      text = insertAfterImportBlock(text, "const UMBREL_DOCKER_MODE = process.env.UMBREL_DOCKER_MODE === 'true'")
+    }
+
+    if (!text.includes('Drives belong to the Docker host')) {
+      text = text.replace(
+        '\tasync getDevices(): Promise<StorageDevice[]> {\n',
+        '\tasync getDevices(): Promise<StorageDevice[]> {\n\t\t// Drives belong to the Docker host, not this container\n\t\tif (UMBREL_DOCKER_MODE) return []\n\n',
+      );
+    }
+
+    return text;
+  });
+
+  // With no visible drives the single-drive view labels its card "Boot storage" and
+  // claims umbrelOS lives on it, and the container note is only shown alongside other
+  // drives (so never). Describe what the numbers actually are: the host volume behind /data.
+  patchFile('packages/ui/src/features/storage/components/single-drive.tsx', (text) => {
+    if (text.includes('const isContainer =')) return text;
+
+    text = text.replace(
+      "\tconst isRaspberryPi = hostEnvironment === 'raspberry-pi'\n",
+      "\tconst isRaspberryPi = hostEnvironment === 'raspberry-pi'\n\tconst isContainer = hostEnvironment === 'docker-container'\n",
+    );
+    text = text.replace(
+      "\tconst failsafeUnavailableReason = [\n" +
+        "\t\tt('storage-manager.mode.failsafe-unavailable-single-drive'),\n" +
+        "\t\t...(canOfferSetupGuidance ? [t('storage-manager.mode.failsafe-unavailable-single-drive-generic')] : []),\n" +
+        "\t].join(' ')\n",
+      "\tconst failsafeUnavailableReason = isContainer\n" +
+        "\t\t? t('storage-manager.mode.failsafe-unavailable-container')\n" +
+        '\t\t: [\n' +
+        "\t\t\t\tt('storage-manager.mode.failsafe-unavailable-single-drive'),\n" +
+        "\t\t\t\t...(canOfferSetupGuidance ? [t('storage-manager.mode.failsafe-unavailable-single-drive-generic')] : []),\n" +
+        "\t\t\t].join(' ')\n",
+    );
+    text = text.replace(
+      "\t\t\t\t\t{bootDrive ? bootDrive.name : t('storage-manager.boot-storage')}\n",
+      "\t\t\t\t\t{bootDrive\n\t\t\t\t\t\t? bootDrive.name\n\t\t\t\t\t\t: isContainer\n\t\t\t\t\t\t\t? t('storage-manager.data-volume')\n\t\t\t\t\t\t\t: t('storage-manager.boot-storage')}\n",
+    );
+    text = text.replace(
+      "<span className='text-13 font-semibold text-white/50'>{t('storage-manager.single-drive')}</span>",
+      "<span className='text-13 font-semibold text-white/50'>\n\t\t\t\t\t\t\t\t\t\t\t{isContainer ? t('storage-manager.host-storage') : t('storage-manager.single-drive')}\n\t\t\t\t\t\t\t\t\t\t</span>",
+    );
+    text = text.replace(
+      "\t\t\t\t\t\t\t\t\t\t\t{t('storage-manager.single-drive.description')}\n",
+      "\t\t\t\t\t\t\t\t\t\t\t{isContainer\n\t\t\t\t\t\t\t\t\t\t\t\t? t('storage-manager.single-drive.description-container')\n\t\t\t\t\t\t\t\t\t\t\t\t: t('storage-manager.single-drive.description')}\n",
+    );
+    return text;
+  });
+
+  // Other languages fall back to English for these (fallbackLng: 'en').
+  patchFile('packages/ui/public/locales/en.json', (text) => {
+    text = insertAfter(
+      text,
+      '  "storage-manager.boot-storage": "Boot storage",\n',
+      '  "storage-manager.data-volume": "Umbrel data volume",\n' +
+        '  "storage-manager.host-storage": "Host storage",\n',
+    );
+    text = insertAfter(
+      text,
+      '  "storage-manager.single-drive.description": "umbrelOS and all of your apps and data live on this drive",\n',
+      '  "storage-manager.single-drive.description-container": "This Umbrel runs in a container, so your apps and data live on the host system\'s storage. Drive health and redundancy are managed on the host.",\n',
+    );
+    return text.replace(
+      /(  "storage-manager\.mode\.failsafe-unavailable-single-drive-generic": .*\n)(?!  "storage-manager\.mode\.failsafe-unavailable-container")/,
+      '$1  "storage-manager.mode.failsafe-unavailable-container": "FailSafe isn\'t available because this Umbrel runs in a container. To protect your data against a drive failure, set up RAID or mirroring on the host system.",\n',
+    );
+  });
+}
+
 function patchLanIngressAdvertiseIp() {
   // The local-HTTPS server cert's SAN list is built from the container's own
   // network interfaces, which are Docker-internal (e.g. 172.17.x.x). Clients
@@ -1023,6 +1103,7 @@ function run() {
   patchDurableFilesystem();
   patchDbusAndFilesServices();
   patchNetworkStorage();
+  patchStorageManager();
   patchIsUmbrelHome();
   patchAppsTs();
   patchAppEnvironment();
